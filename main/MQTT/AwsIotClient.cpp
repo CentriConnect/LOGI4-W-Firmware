@@ -1,0 +1,640 @@
+#include "AwsIotClient.h"
+#include "DeviceShadowState.h"
+#include "LogiSensorData.h"
+#include "AwsIotConfig.h"
+#include "ShadowParser.h"
+#include "esp_log.h"
+#include "esp_secure_cert_read.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
+#include <cstring>
+
+// AWS Root CA Certificate - Amazon Root CA 1
+const char AWS_ROOT_CA[] = R"(-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----)";
+
+// Device cert + private key are no longer compiled into the firmware. They
+// live in the per-board `esp_secure_cert` partition (see partitions.csv) and
+// are written at factory provisioning time alongside the Thing UUID in NVS.
+// AwsIotClient::Initialize() pulls them via esp_secure_cert_mgr.
+
+const char* AwsIotClient::TAG = "AwsIotClient";
+
+AwsIotClient::AwsIotClient()
+    : mqtt_client(nullptr),
+      connected(false),
+      connection_semaphore(nullptr),
+      shadow_semaphore(nullptr),
+      shadow_get_success(false),
+      shadow_update_success(false)
+{
+    connection_semaphore = xSemaphoreCreateBinary();
+    shadow_semaphore = xSemaphoreCreateBinary();
+    telemetry_semaphore = xSemaphoreCreateBinary();
+}
+
+AwsIotClient::~AwsIotClient() {
+    Disconnect();
+    if (mqtt_client) 
+    {
+        esp_mqtt_client_destroy(mqtt_client);
+    }
+    if(connection_semaphore) 
+    {
+        vSemaphoreDelete(connection_semaphore);
+    }
+    if(shadow_semaphore) 
+    {
+        vSemaphoreDelete(shadow_semaphore);
+    }
+    if(telemetry_semaphore) 
+    {
+        vSemaphoreDelete(telemetry_semaphore);
+    }
+}
+
+bool AwsIotClient::PublishTelemetryAndWait(const LogiSensorData& data)
+{
+    if (!connected) {
+        ESP_LOGE(TAG, "Not connected to AWS IoT");
+        return false;
+    }
+    
+    std::string json = createTelemetryJson(data);
+    ESP_LOGI(TAG, "Publishing telemetry and waiting for QoS: %s", json.c_str());
+
+    // Clear the semaphore before publishing
+    xSemaphoreTake(telemetry_semaphore, 0);
+
+    if (!publishMessage(AWS_IOT_TELEMETRY_TOPIC, json.c_str(), 1)) 
+    {
+        ESP_LOGE(TAG, "Failed to publish telemetry message");
+        return false;
+    }
+
+    // Wait for the MQTT_EVENT_PUBLISHED event to give the semaphore
+    if (xSemaphoreTake(telemetry_semaphore, pdMS_TO_TICKS(AWS_IOT_MQTT_COMMAND_TIMEOUT_MS)) == pdTRUE) 
+    {
+        return true; // QoS ACK received
+    }
+    
+    ESP_LOGE(TAG, "Telemetry publish timed out waiting for QoS ACK");
+    return false; 
+}
+
+bool AwsIotClient::Initialize()
+{
+    ESP_LOGI(TAG, "Initializing AWS IoT Client...");
+
+    // Amazon Root CA stays compile-time — it's a public, shared root for every
+    // AWS IoT device on us-east-1. Only the device-unique material lives in
+    // the per-board esp_secure_cert partition.
+    aws_root_ca_pem = AWS_ROOT_CA;
+
+    char* dev_cert = nullptr;
+    uint32_t dev_cert_len = 0;
+    esp_err_t err = esp_secure_cert_get_device_cert(&dev_cert, &dev_cert_len);
+    if (err != ESP_OK || dev_cert == nullptr) {
+        ESP_LOGE(TAG, "esp_secure_cert: device cert read failed (err=0x%x) — board not factory provisioned?", err);
+        return false;
+    }
+    client_cert_pem = dev_cert;
+    client_cert_len = 0;   // null-terminated PEM in flash, MQTT client will strlen
+
+    char* priv_key = nullptr;
+    uint32_t priv_key_len_local = 0;
+    err = esp_secure_cert_get_priv_key(&priv_key, &priv_key_len_local);
+    if (err != ESP_OK || priv_key == nullptr) {
+        ESP_LOGE(TAG, "esp_secure_cert: private key read failed (err=0x%x)", err);
+        return false;
+    }
+    private_key_pem = priv_key;
+    private_key_len = 0;
+
+    ESP_LOGI(TAG, "Certificates loaded from esp_secure_cert partition (cert=%lu B, key=%lu B)",
+             (unsigned long)dev_cert_len, (unsigned long)priv_key_len_local);
+
+    return true;
+}
+
+bool AwsIotClient::Connect() 
+{
+    if (connected) 
+    {
+        ESP_LOGW(TAG, "Already connected");
+        return true;
+    }
+    
+    ESP_LOGI(TAG, "Endpoint: %s:%d", AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    ESP_LOGI(TAG, "Client ID: %s", AWS_IOT_CLIENT_ID);
+    
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    
+    // Build the full URI
+    char uri[256];
+    snprintf(uri, sizeof(uri), "mqtts://%s:%d", AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    mqtt_cfg.broker.address.uri = uri;
+    
+    // Set certificates - don't set lengths, let MQTT client handle it
+    mqtt_cfg.broker.verification.certificate = aws_root_ca_pem;
+    mqtt_cfg.credentials.authentication.certificate = client_cert_pem;
+    mqtt_cfg.credentials.authentication.key = private_key_pem;
+    
+    // Set client ID
+    mqtt_cfg.credentials.client_id = AWS_IOT_CLIENT_ID;
+    
+    // Additional settings
+    mqtt_cfg.network.timeout_ms = AWS_IOT_MQTT_COMMAND_TIMEOUT_MS;
+    mqtt_cfg.session.keepalive = AWS_IOT_MQTT_KEEPALIVE_S;
+    mqtt_cfg.buffer.size = AWS_IOT_MQTT_TX_BUF_LEN;
+    mqtt_cfg.buffer.out_size = AWS_IOT_MQTT_TX_BUF_LEN;
+    
+    // Set protocol version to MQTT 3.1.1 (AWS IoT Core requirement)
+    mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
+    
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (!mqtt_client) 
+    {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+        return false;
+    }
+    
+    esp_mqtt_client_register_event(mqtt_client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, &AwsIotClient::mqtt_event_handler_static, this);
+    
+    esp_err_t err = esp_mqtt_client_start(mqtt_client);
+    if (err != ESP_OK) 
+    {
+        ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(err));
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = nullptr;
+        return false;
+    }
+    
+    // Wait for connection
+    if (!waitForConnection(AWS_IOT_MQTT_COMMAND_TIMEOUT_MS * 2)) 
+    {
+        ESP_LOGE(TAG, "Connection timeout");
+        esp_mqtt_client_stop(mqtt_client);
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = nullptr;
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Successfully connected to AWS IoT");
+    return true;
+}
+
+void AwsIotClient::Disconnect() 
+{
+    if (mqtt_client && connected) 
+    {
+        ESP_LOGI(TAG, "Disconnecting from AWS IoT...");
+        esp_mqtt_client_disconnect(mqtt_client);
+        esp_mqtt_client_stop(mqtt_client);
+        connected = false;
+    }
+}
+
+bool AwsIotClient::IsConnected() const 
+{
+    return connected.load();
+}
+
+void AwsIotClient::mqtt_event_handler_static(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) 
+{
+    AwsIotClient* instance = static_cast<AwsIotClient*>(handler_args);
+    instance->handleMqttEvent(static_cast<esp_mqtt_event_handle_t>(event_data));
+}
+
+void AwsIotClient::handleMqttEvent(esp_mqtt_event_handle_t event) 
+{
+    switch (event->event_id) 
+    {
+        case MQTT_EVENT_CONNECTED:
+        {
+            ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+            connected = true;
+            xSemaphoreGive(connection_semaphore);
+            
+            // Subscribe to shadow topics
+            subscribeToTopic(AWS_IOT_SHADOW_UPDATE_DELTA, 1);
+            subscribeToTopic(AWS_IOT_SHADOW_GET_ACCEPTED, 1);
+            subscribeToTopic(AWS_IOT_SHADOW_GET_REJECTED, 1);
+            subscribeToTopic(AWS_IOT_SHADOW_UPDATE_ACCEPTED, 1);
+            subscribeToTopic(AWS_IOT_SHADOW_UPDATE_REJECTED, 1);
+            break;
+        }
+        case MQTT_EVENT_DISCONNECTED:
+        {
+            ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+            connected = false;
+            break;
+        }
+        case MQTT_EVENT_PUBLISHED: 
+        {
+            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+            xSemaphoreGive(telemetry_semaphore);
+            break;
+        }
+        case MQTT_EVENT_DATA:
+        {
+            ESP_LOGD(TAG, "Received Topic: %.*s", event->topic_len, event->topic);
+            std::string topic(event->topic, event->topic_len);
+            std::string data(event->data, event->data_len);
+
+            if (topic.find("/shadow/get/accepted") != std::string::npos) 
+            {
+                if (parseShadowDocument(data.c_str(), current_shadow_state)) 
+                {
+                    shadow_get_success = true;
+                }
+                xSemaphoreGive(shadow_semaphore);
+            } 
+            else if (topic.find("/shadow/get/rejected") != std::string::npos) 
+            {
+                ESP_LOGE(TAG, "Shadow get rejected: %s", data.c_str());
+                shadow_get_success = false;
+                xSemaphoreGive(shadow_semaphore);
+            }
+            else if (topic.find("/shadow/update/accepted") != std::string::npos) 
+            {
+                shadow_update_success = true;
+                xSemaphoreGive(shadow_semaphore);
+            }
+            else if (topic.find("/shadow/update/rejected") != std::string::npos) 
+            {
+                ESP_LOGE(TAG, "Shadow update rejected: %s", data.c_str());
+                shadow_update_success = false;
+                xSemaphoreGive(shadow_semaphore);
+            }
+            else if (topic.find("/shadow/update/delta") != std::string::npos)
+            {
+                DeviceShadowState delta_state;
+                if (parseShadowDocument(data.c_str(), delta_state) && shadow_delta_callback)
+                {
+                    // Merge delta into current state
+                    MergeShadowDelta(current_shadow_state, delta_state);
+                    shadow_delta_callback(current_shadow_state);
+                }
+            }
+            else if (generic_message_callback)
+            {
+                // Forward unhandled topics (e.g. job notifications) to registered handler
+                generic_message_callback(topic, data);
+            }
+            break;
+        }
+        
+        case MQTT_EVENT_ERROR:
+        {
+            ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) 
+            {
+                ESP_LOGE(TAG, "TCP Error code: %d", event->error_handle->esp_transport_sock_errno);
+            } 
+            else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) 
+            {
+                ESP_LOGE(TAG, "Connection refused error: %d", event->error_handle->connect_return_code);
+            } 
+            else 
+            {
+                ESP_LOGE(TAG, "Unknown error type: %d", event->error_handle->error_type);
+            }
+            break;
+        }
+        default:
+            ESP_LOGD(TAG, "Other event id:%d", event->event_id);
+            break;
+    }
+}
+
+bool AwsIotClient::waitForConnection(uint32_t timeoutMs) 
+{
+    if (xSemaphoreTake(connection_semaphore, pdMS_TO_TICKS(timeoutMs)) == pdTRUE) 
+    {
+        return true;
+    }
+    ESP_LOGE(TAG, "Connection timed out");
+    return false;
+}
+
+bool AwsIotClient::waitForShadowResponse(uint32_t timeoutMs) 
+{
+    return xSemaphoreTake(shadow_semaphore, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+bool AwsIotClient::subscribeToTopic(const char* topic, int qos) 
+{
+    if (!IsConnected()) return false;
+    int msg_id = esp_mqtt_client_subscribe(mqtt_client, topic, qos);
+    ESP_LOGD(TAG, "Subscribed to %s, msg_id=%d", topic, msg_id);
+    return msg_id != -1;
+}
+
+bool AwsIotClient::publishMessage(const char* topic, const char* message, int qos) 
+{
+    if (!IsConnected()) return false;
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, message, 0, qos, 0);
+    return msg_id != -1;
+}
+
+std::string AwsIotClient::createTelemetryJson(const LogiSensorData& data)
+{
+    cJSON* root = cJSON_CreateObject();
+
+    // Add timestamp
+    time_t now;
+    time(&now);
+    cJSON_AddNumberToObject(root, "timestamp", now);
+
+    // Add sensor data
+    cJSON_AddNumberToObject(root, "temperature_c", data.MeasuredTemperatureC);
+    cJSON_AddNumberToObject(root, "humidity_percent", data.MeasuredHumidityPercentage);
+    cJSON_AddNumberToObject(root, "battery_level", data.PublishedBatteryLevel);
+    cJSON_AddNumberToObject(root, "fuel_level", data.PublishedFuelLevel);
+    cJSON_AddNumberToObject(root, "battery_voltage", data.AnalogBatteryVoltage);
+    cJSON_AddNumberToObject(root, "fuel_voltage", data.AnalogFuelVoltage);
+    cJSON_AddNumberToObject(root, "solar_voltage", data.SolarVoltage);
+    cJSON_AddNumberToObject(root, "battery_temp_c", data.BatteryTemperatureC);
+    cJSON_AddNumberToObject(root, "sensor_supply_voltage", data.SensorSupplyVoltage);
+
+    char* json_str = cJSON_PrintUnformatted(root);
+    std::string result(json_str);
+    cJSON_Delete(root);
+    free(json_str);
+    return result;
+}
+
+std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& data, const TelemetryContext& ctx)
+{
+    cJSON* root = cJSON_CreateObject();
+
+    // === Identification ===
+    if (ctx.deviceIdValid)
+    {
+        cJSON_AddStringToObject(root, "DeviceId", ctx.deviceId);
+    }
+    if (ctx.imeiValid)
+    {
+        cJSON_AddStringToObject(root, "Imei", ctx.imei);
+    }
+    if (ctx.iccidValid)
+    {
+        cJSON_AddStringToObject(root, "Iccid", ctx.iccid);
+    }
+
+    // === Timestamps & Versioning ===
+    if (ctx.dateTimeIsoValid)
+    {
+        cJSON_AddStringToObject(root, "DateTimeIso", ctx.dateTimeIso);
+    }
+    if (ctx.mqttSchemaValid)
+    {
+        cJSON_AddStringToObject(root, "MqttSchema", ctx.mqttSchema);
+    }
+    if (ctx.deviceVersionValid)
+    {
+        cJSON_AddStringToObject(root, "DeviceVersion", ctx.deviceVersion);
+    }
+    if (ctx.modemFirmwareVersionValid)
+    {
+        cJSON_AddStringToObject(root, "ModemFirmwareVersion", ctx.modemFirmwareVersion);
+    }
+
+    // === Sensor Data (always valid from LogiSensorData) ===
+    cJSON_AddNumberToObject(root, "FuelLevel", data.PublishedFuelLevel);
+    cJSON_AddNumberToObject(root, "RawLevelCounts", data.AnalogFuelVoltage);
+    cJSON_AddNumberToObject(root, "SupplyVoltage", data.SensorSupplyVoltage);
+    cJSON_AddNumberToObject(root, "BatteryVolts", data.AnalogBatteryVoltage);
+    cJSON_AddNumberToObject(root, "BatteryTemperature", data.BatteryTemperatureC);
+    cJSON_AddNumberToObject(root, "SolarVolts", data.SolarVoltage);
+    cJSON_AddNumberToObject(root, "TempC", static_cast<int32_t>(data.MeasuredTemperatureC));
+
+    // === Location (GPS) ===
+    cJSON_AddNumberToObject(root, "Latitude", data.GPSData.latitude);
+    cJSON_AddNumberToObject(root, "Longitude", data.GPSData.longitude);
+    cJSON_AddNumberToObject(root, "Altitude", data.GPSData.altitude);
+
+    // GPS Signal Quality - format as "HDOP,VDOP,PDOP" (simplified for now)
+    char gpsQuality[32];
+    snprintf(gpsQuality, sizeof(gpsQuality), "%d,0,0", data.GPSData.rssi);
+    cJSON_AddStringToObject(root, "GpsSignalQuality", gpsQuality);
+
+    // === Network & Status ===
+    if (ctx.lteSignalQualityValid)
+    {
+        cJSON_AddNumberToObject(root, "LteSignalQuality", ctx.lteSignalQuality);
+    }
+    if (ctx.chargerStatusValid)
+    {
+        cJSON_AddNumberToObject(root, "ChargerStatus", ctx.chargerStatus);
+    }
+    if (ctx.bleStatusValid)
+    {
+        cJSON_AddNumberToObject(root, "BleStatus", ctx.bleStatus);
+    }
+    if (ctx.deviceStatusValid)
+    {
+        cJSON_AddNumberToObject(root, "DeviceStatus", ctx.deviceStatus);
+    }
+    if (ctx.errorLogValid)
+    {
+        cJSON_AddStringToObject(root, "ErrorLog", ctx.errorLog);
+    }
+    if (ctx.resetCounterValid)
+    {
+        cJSON_AddNumberToObject(root, "ResetCounter", ctx.resetCounter);
+    }
+
+    // === Configuration Echo ===
+    if (ctx.postingScheduleValid)
+    {
+        cJSON_AddStringToObject(root, "PostingSchedule", ctx.postingSchedule);
+    }
+    if (ctx.fillDwellTimeValid)
+    {
+        cJSON_AddNumberToObject(root, "FillDwellTime", ctx.fillDwellTime);
+    }
+    if (ctx.fillPostDeltaValueValid)
+    {
+        cJSON_AddNumberToObject(root, "FillPostDeltaValue", ctx.fillPostDeltaValue);
+    }
+    if (ctx.lteAttemptTimeoutValid)
+    {
+        cJSON_AddNumberToObject(root, "LteAttemptTimeout", ctx.lteAttemptTimeout);
+    }
+    if (ctx.postDwellTimeValid)
+    {
+        cJSON_AddNumberToObject(root, "PostDwellTime", ctx.postDwellTime);
+    }
+
+    char* json_str = cJSON_PrintUnformatted(root);
+    std::string result(json_str);
+    cJSON_Delete(root);
+    free(json_str);
+    return result;
+}
+
+bool AwsIotClient::PublishTelemetryLogi4Format(const LogiSensorData& data, const TelemetryContext& context)
+{
+    if (!connected)
+    {
+        ESP_LOGE(TAG, "Not connected to AWS IoT");
+        return false;
+    }
+
+    std::string json = createTelemetryJsonLogi4Format(data, context);
+    ESP_LOGI(TAG, "Publishing LOGI4 telemetry: %s", json.c_str());
+
+    // Clear the semaphore before publishing
+    xSemaphoreTake(telemetry_semaphore, 0);
+
+    if (!publishMessage(AWS_IOT_TELEMETRY_TOPIC, json.c_str(), 1))
+    {
+        ESP_LOGE(TAG, "Failed to publish LOGI4 telemetry message");
+        return false;
+    }
+
+    // Wait for QoS acknowledgment
+    if (xSemaphoreTake(telemetry_semaphore, pdMS_TO_TICKS(AWS_IOT_MQTT_COMMAND_TIMEOUT_MS)) == pdTRUE)
+    {
+        ESP_LOGI(TAG, "LOGI4 telemetry published and acknowledged");
+        return true;
+    }
+
+    ESP_LOGE(TAG, "LOGI4 telemetry publish timed out waiting for QoS ACK");
+    return false;
+}
+
+std::string AwsIotClient::createShadowUpdateJson(const DeviceShadowState& state) 
+{
+    // Use the enhanced shadow update creator
+    return CreateEnhancedShadowUpdate(state, nullptr);
+}
+
+std::string AwsIotClient::createShadowUpdateJsonWithSensorData(const DeviceShadowState& state, const LogiSensorData& sensorData) 
+{
+    return CreateEnhancedShadowUpdate(state, &sensorData);
+}
+
+bool AwsIotClient::parseShadowDocument(const char* payload, DeviceShadowState& stateOut) 
+{
+    // Use the enhanced parser
+    return ParseEnhancedShadowDocument(payload, stateOut);
+}
+
+bool AwsIotClient::GetDeviceShadow(DeviceShadowState& outState) 
+{
+    if (!connected) 
+    {
+        ESP_LOGE(TAG, "Not connected to AWS IoT");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Getting device shadow...");
+    
+    // Clear previous state
+    shadow_get_success = false;
+    xSemaphoreTake(shadow_semaphore, 0); 
+    
+    // Request shadow
+    if (!publishMessage(AWS_IOT_SHADOW_GET_TOPIC, "{}", 1)) 
+    {
+        ESP_LOGE(TAG, "Failed to publish shadow get request");
+        return false;
+    }
+    
+    // Wait for response
+    if (!waitForShadowResponse(AWS_IOT_MQTT_COMMAND_TIMEOUT_MS)) 
+    {
+        ESP_LOGE(TAG, "Shadow get timeout");
+        return false;
+    }
+    
+    if (shadow_get_success) 
+    {
+        ESP_LOGI(TAG, "Received device shadow!");
+        outState = current_shadow_state;
+        return true;
+    }
+    
+    return false;
+}
+
+bool AwsIotClient::UpdateDeviceShadow(const DeviceShadowState& state) 
+{
+    if (!connected) 
+    {
+        ESP_LOGE(TAG, "Not connected to AWS IoT");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Updating device shadow...");
+    
+    std::string json = createShadowUpdateJson(state);
+    
+    // Clear previous state
+    shadow_update_success = false;
+    xSemaphoreTake(shadow_semaphore, 0); // Clear semaphore
+    
+    // Update shadow
+    if (!publishMessage(AWS_IOT_SHADOW_UPDATE_TOPIC, json.c_str(), 1)) 
+    {
+        ESP_LOGE(TAG, "Failed to publish shadow update");
+        return false;
+    }
+    
+    // Wait for response
+    if (!waitForShadowResponse(AWS_IOT_MQTT_COMMAND_TIMEOUT_MS)) 
+    {
+        ESP_LOGE(TAG, "Shadow update timeout");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Updated device shadow!");
+    
+    return shadow_update_success;
+}
+
+bool AwsIotClient::PublishTelemetry(const LogiSensorData& data) 
+{
+    if (!connected) 
+    {
+        ESP_LOGE(TAG, "Not connected to AWS IoT");
+        return false;
+    }
+    
+    std::string json = createTelemetryJson(data);
+    ESP_LOGI(TAG, "Publishing telemetry: %s", json.c_str());
+    
+    return publishMessage(AWS_IOT_TELEMETRY_TOPIC, json.c_str(), 1);
+}
+
+void AwsIotClient::ProcessMessages(uint32_t timeoutMs) 
+{
+    // ESP-IDF MQTT client handles messages in its own task
+    vTaskDelay(pdMS_TO_TICKS(timeoutMs));
+}
+
+void AwsIotClient::SetShadowDeltaCallback(std::function<void(const DeviceShadowState&)> callback) 
+{
+    shadow_delta_callback = callback;
+}

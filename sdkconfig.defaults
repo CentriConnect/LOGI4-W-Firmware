@@ -1,0 +1,55 @@
+# OTA Rollback
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Flash & Partition Table
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# MMU Page Size
+CONFIG_MMU_PAGE_SIZE_64KB=y
+
+# BLE - NimBLE stack
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# mbedTLS threading (required for multi-threaded TLS / corePKCS11)
+CONFIG_MBEDTLS_THREADING_C=y
+CONFIG_MBEDTLS_THREADING_ALT=n
+CONFIG_MBEDTLS_THREADING_PTHREAD=y
+
+# Main task stack (provisioning BLE scheme requires more)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# esp_secure_cert_mgr — use plain key in encrypted flash partition, not DS peripheral.
+# The partition itself is encrypted via the partition table's `encrypted` flag.
+# DS would add HSM-grade key protection but requires extra ciphertext+HMAC artifacts
+# that the simple configure_esp_secure_cert.py partition-only flow doesn't produce.
+CONFIG_ESP_SECURE_CERT_DS_PERIPHERAL=n
+
+# Project-specific
+CONFIG_LOGI_DEFAULT_FILL_DWELL_TIME_S=3000
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=512
+CONFIG_LOG_COLORS=y
+
+# REQ-PROV-02: power-management framework for light sleep during prov window.
+# Ports the proven-good config from the sleep-test repo light-sleep-test branch
+# (~3.79 mA @ 1000ms BLE ADV). PM auto-enters light sleep when FreeRTOS is idle;
+# explicit PM locks gate this on/off per phase (prov = allow, duty cycle = deny).
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_BT_LE_SLEEP_ENABLE=y
+CONFIG_ESP_PHY_MAC_BB_PD=y
+
+# v1.2.1: keep the device OUT of auto light sleep while a USB host is attached
+# to the USB-Serial-JTAG port. Without this, the 48h provisioning window's
+# light sleep killed the USJ console/flash port (ISS-006, Nick bug report
+# board 2 "port closes"). Field units (no USB attached) still light-sleep.
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
+
+# v1.3.0: board rev 4.1+ carries Y1 = 32.768 kHz crystal on IO0/IO1 (the rev-4.1
+# analog map freed those pins from ADC duty). External crystal as RTC slow clock
+# gives accurate deep-sleep wake timing and is the only LP clock that supports
+# full BLE through light sleep (per IDF BT_LE_LP_CLK_SRC help). On a rev-4.0
+# board (no crystal) IDF falls back to the internal RC with a boot warning.
+CONFIG_RTC_CLK_SRC_EXT_CRYS=y
+CONFIG_BT_LE_LP_CLK_SRC_DEFAULT=y

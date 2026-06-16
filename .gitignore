@@ -1,0 +1,7 @@
+build/
+sdkconfig
+sdkconfig.old
+build.bat
+flash.bat
+flash-only.bat
+merge.bat
