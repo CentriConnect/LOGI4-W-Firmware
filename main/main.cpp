@@ -1298,10 +1298,13 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "--- Device Starting ---");
 
-    // Flash window for safety
+    // Flash window for safety. 3 s: with light sleep disabled in provisioning
+    // (V13-013) the device stays awake and remains reflashable for the whole
+    // provisioning window, so the long boot countdown is redundant and only
+    // delayed the blue LED. Restore a longer window if/when light sleep returns.
     printf("\n\n=== LOGI4W Application Firmware ===\n");
-    printf("Flash window: 20 seconds...\n");
-    for (int i = 20; i > 0; i--) {
+    printf("Flash window: 3 seconds...\n");
+    for (int i = 3; i > 0; i--) {
         printf("%d... ", i);
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(1000));
