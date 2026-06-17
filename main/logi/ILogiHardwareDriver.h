@@ -107,6 +107,12 @@ public:
     virtual bool GetGpsData(GpsData_t& gpsData) = 0;
     virtual void PrintGpsStatus() = 0;
     virtual bool HasValidGpsFix() = 0;
+
+    /// <summary>
+    /// Powers the GNSS module on/off independently of a measurement cycle, so it
+    /// can acquire a fix in the background (e.g. across the activation cycle).
+    /// </summary>
+    virtual void SetGnssPower(bool on) = 0;
 };
 
 #endif // I_LOGI_HARDWARE_DRIVER_H

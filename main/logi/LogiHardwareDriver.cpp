@@ -333,10 +333,12 @@ bool LogiHardwareDriver::SaturateFilters()
 {
     LOGI_DRV_LOG_INF("Saturating filters (Capacity: %d)...", MovingAverage::CAPACITY);
     _sensorPowerGpio.Write(true);
-    if (_i2cBusRecoveryHook != nullptr)
-    {
-        _i2cBusRecoveryHook();
-    }
+    // V13-010 root cause: do NOT rebuild the I2C bus every cycle. The recovery
+    // hook (RecoverI2cBus) is last-resort recovery for a *wedged* bus; running it
+    // per measurement tore down + re-added the ADS1015 mid-read, so the 2nd+
+    // back-to-back read returned bad supply -> fuel/raw/supv zeroed together (the
+    // ratiometric fuel calc needs supply). The factory builds the bus cleanly;
+    // recover only on an actual wedge, not on the happy path.
     DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
@@ -412,10 +414,8 @@ void LogiHardwareDriver::UpdateMeasurements()
 {
     LOGI_DRV_LOG_DBG("Updating measurements...");
     _sensorPowerGpio.Write(true);
-    if (_i2cBusRecoveryHook != nullptr)
-    {
-        _i2cBusRecoveryHook();
-    }
+    // V13-010 root cause: no per-measurement I2C bus teardown (see SaturateFilters).
+    // Tearing down/re-adding the ADS1015 each call broke back-to-back reads.
     DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
@@ -530,6 +530,18 @@ void LogiHardwareDriver::GetLatestSensorData(LogiSensorData &sensorData)
 
     // Disable GNSS power after reading GPS data to save power
     _gnssEnableGpio.Write(false);
+}
+
+void LogiHardwareDriver::SetGnssPower(bool on)
+{
+    // Power the GNSS module independently of a measurement cycle so it can
+    // acquire a fix in the background (e.g. across the activation cycle).
+    _gnssEnableGpio.Write(on);
+    if (on)
+    {
+        _gnssResetGpio.Write(true);  // release GNSS_RESET_N so the module runs
+    }
+    LOGI_DRV_LOG_DBG("GNSS power %s", on ? "ON" : "OFF");
 }
 
 // --- LED Control --- (Implementation remains the same as previous version)
