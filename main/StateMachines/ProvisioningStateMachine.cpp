@@ -286,7 +286,13 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
     ESP_LOGI(TAG, "Provisioning successful — running first-boot sequence then %d-min display",
              CONFIG_LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN);
 
-    // REQ-FIRSTBOOT-01: run post -> jobs -> shadow -> post BEFORE the long
+    // Green LED on from AWS-connect so it blinks 1 Hz for the WHOLE window (the
+    // first-boot cycle + the 30-min success-display hold), per the activation spec.
+    if (_driver) {
+        _driver->SetLedState(LedState::LedState_GreenBlink);
+    }
+
+    // REQ-FIRSTBOOT-01: run post -> shadow -> jobs -> post BEFORE the long
     // success-display window, while AWS is still connected.
     _firstBootSubStep = 0;
     _firstBootStepStartMs = esp_timer_get_time() / 1000;
@@ -299,9 +305,9 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
 // steps.
 //
 // Sub-step layout:
-//   0 -> publish initial telemetry (POST #1)
-//   1 -> request pending jobs
-//   2 -> fetch device shadow and apply desired-state fields to DeviceSettings
+//   0 -> publish initial telemetry (POST #1, ACK: sensors, no GPS)
+//   1 -> fetch device shadow and apply desired-state fields to DeviceSettings
+//   2 -> request pending jobs (OTA)
 //   3 -> publish telemetry again with updated context (POST #2)
 //   4 -> disconnect AWS, hand off to SuccessDisplay
 //
@@ -335,18 +341,27 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
 
     switch (_firstBootSubStep) {
     case 0: {
-        // POST #1 — initial telemetry. Sensors have not necessarily been
-        // sampled yet during prov, so this sends a zero-init LogiSensorData.
-        // Telemetry contents don't drive cloud state at this point; the
-        // goal is to confirm the publish path works and to mark the device
-        // "online" in the registry. Identity (deviceId/imei) lives in
-        // TelemetryContext and is stamped by AwsIotClient internally.
-        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [1/4]: initial POST");
+        // POST #1 — activation "ack" post. V13-010: sample the (fast) sensors
+        // first so this carries real battery/fuel/temp/solar/supply values
+        // instead of a zero-init struct (which published bat:0/ful:0/amb:0/...
+        // to the cloud). GPS is not waited on here (no fix yet -> 0; it fills in
+        // the duty loop). Identity (deviceId/imei) lives in TelemetryContext and
+        // is stamped by AwsIotClient internally.
+        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [1/4]: initial (ack) POST");
         if (client) {
-            LogiSensorData sd{};
+            // V13-010: sample ONCE here and cache it; the [4/4] confirm post
+            // reuses this snapshot (re-measuring back-to-back makes the 2nd
+            // fuel read fail -> ful/raw/supv zeros).
+            if (_driver) {
+                _driver->UpdateMeasurements();
+                _driver->GetLatestSensorData(_firstBootSensorSnapshot);
+                // GPS: GetLatestSensorData powered GNSS off; re-enable it so it
+                // can acquire a fix across shadow/jobs for the final post.
+                _driver->SetGnssPower(true);
+            }
             TelemetryContext context{};
-            populateFirstBootTelemetryContext(context, sd);
-            bool ok = client->PublishTelemetryLogi4Format(sd, context);
+            populateFirstBootTelemetryContext(context, _firstBootSensorSnapshot);
+            bool ok = client->PublishTelemetryLogi4Format(_firstBootSensorSnapshot, context);
             ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [1/4]: POST %s", ok ? "ok" : "FAILED");
         } else {
             ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [1/4]: no client — skipped");
@@ -356,19 +371,7 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
     }
 
     case 1: {
-        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: request pending jobs");
-        if (jobs) {
-            bool ok = jobs->RequestPendingJobs();
-            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: jobs %s", ok ? "requested" : "FAILED");
-        } else {
-            ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [2/4]: no jobs handler — skipped");
-        }
-        _firstBootSubStep = 2;
-        break;
-    }
-
-    case 2: {
-        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: fetch shadow + apply to DeviceSettings");
+        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: fetch shadow + apply to DeviceSettings");
         DeviceShadowState shadow{};
         bool ok = _awsIotManager->GetEnhancedShadow(shadow);
         if (ok && _deviceSettings) {
@@ -380,10 +383,22 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
             if (shadow.fill_alarm_delta != 0) _deviceSettings->setFillAlarmDelta(shadow.fill_alarm_delta);
             if (shadow.post_dwell_time  != 0) _deviceSettings->setPostDwellTime(shadow.post_dwell_time);
             if (shadow.ble_adv_time     != 0) _deviceSettings->setBleAdvTime(shadow.ble_adv_time);
-            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: shadow applied");
+            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow applied");
         } else {
-            ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [3/4]: shadow fetch %s",
+            ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow fetch %s",
                      ok ? "ok but no DeviceSettings to apply" : "FAILED");
+        }
+        _firstBootSubStep = 2;
+        break;
+    }
+
+    case 2: {
+        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: request pending jobs");
+        if (jobs) {
+            bool ok = jobs->RequestPendingJobs();
+            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: jobs %s", ok ? "requested" : "FAILED");
+        } else {
+            ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [3/4]: no jobs handler — skipped");
         }
         _firstBootSubStep = 3;
         break;
@@ -616,15 +631,19 @@ bool ProvisioningStateMachine::publishFirstBootTelemetry(AwsIotClient* client)
         return false;
     }
 
-    LogiSensorData sensorData{};
-    if (_driver != nullptr) {
-        _driver->UpdateMeasurements();
-        _driver->GetLatestSensorData(sensorData);
+    // V13-010: REUSE the sensor snapshot taken at the [1/4] ack post instead of
+    // re-measuring (two back-to-back UpdateMeasurements zero the 2nd fuel read).
+    // GPS is the exception: merge the latest fix here so the final/confirm post
+    // carries coordinates if one was acquired during shadow/jobs (0 if not),
+    // then power GNSS down. Shadow-applied settings come via the rebuilt context.
+    if (_driver) {
+        _driver->GetGpsData(_firstBootSensorSnapshot.GPSData);
+        _driver->SetGnssPower(false);
     }
 
     TelemetryContext context{};
-    populateFirstBootTelemetryContext(context, sensorData);
-    return client->PublishTelemetryLogi4Format(sensorData, context);
+    populateFirstBootTelemetryContext(context, _firstBootSensorSnapshot);
+    return client->PublishTelemetryLogi4Format(_firstBootSensorSnapshot, context);
 }
 
 void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContext& ctx, const LogiSensorData& data) const

@@ -9,6 +9,7 @@
 #include "ILogiHardwareDriver.h"
 #include "MQTT/AwsIotManager.h"
 #include "logi/DeviceSettings.h"  // REQ-BLE-01: BLE name uses first 4 of DeviceID UUID
+#include "logi/LogiSensorData.h"  // V13-010: cached first-boot sensor snapshot
 
 #include <esp_err.h>
 #include <esp_event.h>
@@ -89,6 +90,11 @@ private:
     // sequence. Each update() tick advances one step so the state machine
     // stays non-blocking.
     uint8_t _firstBootSubStep = 0;
+
+    // V13-010: sensor snapshot sampled at the [1/4] ack post and REUSED by the
+    // [4/4] confirm post, so the activation never runs two back-to-back
+    // measurements (the 2nd fuel read fails -> ful/raw/supv zeros).
+    LogiSensorData _firstBootSensorSnapshot{};
     int64_t _firstBootStepStartMs = 0;
 
     EspNvsStorage* _nvsStorage;
