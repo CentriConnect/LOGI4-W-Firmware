@@ -1294,22 +1294,30 @@ extern "C" void app_main(void)
 
 static const char *TAG = "AppMain";
 
+// Boot reflash-safety window, in seconds. 0 = DISABLED (no countdown; blue LED
+// in ~2 s). Set to e.g. 20 to restore the original buttonless-board reflash
+// window - useful again if/when light sleep is re-introduced in provisioning
+// (a sleeping device is harder to catch for reflash). Disabled for now: with
+// light sleep off in prov (V13-013) the device stays awake/reflashable anyway.
+#define BOOT_FLASH_WINDOW_SEC 0
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "--- Device Starting ---");
 
-    // Flash window for safety. 3 s: with light sleep disabled in provisioning
-    // (V13-013) the device stays awake and remains reflashable for the whole
-    // provisioning window, so the long boot countdown is redundant and only
-    // delayed the blue LED. Restore a longer window if/when light sleep returns.
     printf("\n\n=== LOGI4W Application Firmware ===\n");
-    printf("Flash window: 3 seconds...\n");
-    for (int i = 3; i > 0; i--) {
+#if BOOT_FLASH_WINDOW_SEC > 0
+    // Reflash-safety countdown (gated behind BOOT_FLASH_WINDOW_SEC; see define).
+    printf("Flash window: %d seconds...\n", BOOT_FLASH_WINDOW_SEC);
+    for (int i = BOOT_FLASH_WINDOW_SEC; i > 0; i--) {
         printf("%d... ", i);
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     printf("\nStarting application...\n\n");
+#else
+    printf("Flash window disabled (BOOT_FLASH_WINDOW_SEC=0); starting application immediately.\n\n");
+#endif
 
     if (!Platform::InitializeSystem()) {
         ESP_LOGE(TAG, "Core Platform Initialization Failed! Halting.");
