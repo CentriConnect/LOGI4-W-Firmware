@@ -628,13 +628,15 @@ void PostingStateMachine::PostingStatePostFinalTelemetry()
     }
 
     _dwellStartTime = _timeKeeper->GetCurrentTime();
-    ESP_LOGI(TAG, "Activation [5/5]: flashing green LED for post dwell (%lu seconds), then sleep",
+    ESP_LOGI(TAG, "Activation [5/5]: post dwell (%lu seconds) with LED OFF, then sleep",
              (unsigned long)getPostDwellTimeSeconds());
 
+    // No LED in the normal duty loop: the LED is provisioning-blue and the
+    // 30-min post-activation green ONLY. Keep it off through dwell + deep sleep.
     ILogiHardwareDriver* driver = _parentStateMachine ? _parentStateMachine->GetHardwareDriver() : nullptr;
     if (driver != nullptr)
     {
-        driver->SetLedState(LedState::LedState_GreenBlink);
+        driver->SetLedState(LedState::LedState_Off);
     }
 
     transitionTo(PostingState::PostingState_PostDwell);
