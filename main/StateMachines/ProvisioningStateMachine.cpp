@@ -510,8 +510,17 @@ esp_err_t ProvisioningStateMachine::startProvisioningService()
     // (CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION) holds them out of light sleep
     // while a host is attached. Joulescope target ~3.79 mA @ 1000 ms ADV.
     if (_powerManager) {
-        _powerManager->AllowLightSleep(true);
-        ESP_LOGI(TAG, "Prov: light sleep ALLOWED (REQ-PROV-02, crystal LP clock; USB host blocks it on bench)");
+        // V13-013 FIX: do NOT enable light sleep in the provisioning window. With
+        // light sleep allowed, the device hard-hangs and is reset by the interrupt
+        // watchdog (INT_WDT, reset_reason=5): the free-running LED I2C write lands
+        // across a light-sleep entry/exit on the marginal bus and stalls with
+        // interrupts disabled. Symptom (V13-013): activation/blue LED only start
+        // when a USB host holds the USJ awake (CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION
+        // masks it); battery/no-COM field units look dead. It also saves ~no power
+        // (WiFi STA is up the whole window). Keep the window AWAKE; battery life
+        // comes from deep sleep in the duty cycle, not light sleep here.
+        _powerManager->AllowLightSleep(false);
+        ESP_LOGI(TAG, "Prov: light sleep DISABLED (V13-013 INT_WDT fix) - window stays awake");
     }
 
     wifi_prov_mgr_config_t config = {
