@@ -19,7 +19,7 @@ class PostingStateMachine
 {
 public:
     PostingStateMachine(AwsIotManager* awsIotManager, EspTimeKeeper* timeKeeper,
-                        LogiSensorData& sensorData, const DeviceSettings& deviceSettings);
+                        LogiSensorData& sensorData, DeviceSettings& deviceSettings);
 
     void update();    
 
@@ -33,7 +33,7 @@ private:
     AwsIotManager* _awsIotManager;
     EspTimeKeeper* _timeKeeper;
     LogiSensorData& _sensorData;
-    const DeviceSettings& _deviceSettings;
+    DeviceSettings& _deviceSettings;
 
     DeviceShadowState _shadowState;
 
@@ -46,7 +46,7 @@ private:
     const int MAX_CONNECT_RETRIES = 3;
 
     // Add Jobs handler and FOTA related members
-    std::unique_ptr<AwsIotJobsHandler> _jobsHandler;
+    AwsIotJobsHandler* _jobsHandler = nullptr;
     std::optional<AwsIotJob> _currentFotaJob;
     bool _fotaCheckComplete = false;
 
@@ -58,17 +58,22 @@ private:
 
     // Populates TelemetryContext with device info, settings, etc. for LOGI4 format
     void populateTelemetryContext(TelemetryContext& context) const;
+    bool publishTelemetrySnapshot(const LogiSensorData& data, const char* label);
+    void applyShadowSettingsToMemory(const DeviceShadowState& shadowState);
 
     // State handler methods
     void PostingStateInitialEnter();
     void PostingStateExitAWS();
     void PostingStateTryConnect();
+    void PostingStatePostImmediateTelemetry();
     void PostingStateSubscribeToTopics();
     void PostingStateSendGetShadowDelta();
     void PostingStateGotShadowDelta();
     void PostingStateHandleShadowDelta();
     void PostingStateCheckFOTA();
     void PostingStateDoFOTAUpdate();
+    void PostingStateAcquireFinalSample();
+    void PostingStatePostFinalTelemetry();
     void PostingStateDoPostsFromQueue();
     void PostingStatePostDwell();
 };

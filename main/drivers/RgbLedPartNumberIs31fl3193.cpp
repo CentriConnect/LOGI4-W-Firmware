@@ -195,12 +195,9 @@ bool RgbLedPartNumberIs31fl3193::ConfigureBreathingTiming(uint8_t channel, uint8
     uint8_t t1t2_reg = IS31FL3193_REG_T1T2_CH0 + channel;
     uint8_t t3t4_reg = IS31FL3193_REG_T3T4_CH0 + channel;
 
-    bool success = true;
-    success &= WriteRegister(t0_reg, t0);
-    success &= WriteRegister(t1t2_reg, t1t2);
-    success &= WriteRegister(t3t4_reg, t3t4);
-
-    return success;
+    return WriteRegister(t0_reg, t0) &&
+           WriteRegister(t1t2_reg, t1t2) &&
+           WriteRegister(t3t4_reg, t3t4);
 }
 
 // --- Public Device Control Functions (using HAL) ---
@@ -211,7 +208,6 @@ bool RgbLedPartNumberIs31fl3193::ConfigureBreathingTiming(uint8_t channel, uint8
 bool RgbLedPartNumberIs31fl3193::InitializeDevice()
 {
     IS31FL3193_LOG_DBG("Initializing IS31FL3193...");
-    bool success = true;
 
     // Configure standby GPIO as Output and set to Active state
     // IS31FL3193 SDB pin: HIGH = active (normal operation), LOW = shutdown/standby
@@ -223,40 +219,53 @@ bool RgbLedPartNumberIs31fl3193::InitializeDevice()
     if (gpio_err != HAL_GPIO_OK)
     {
         IS31FL3193_LOG_ERR("Failed to configure/set standby GPIO to active state! Err: %d", gpio_err);
-        success = false; // Treat GPIO failure as initialization failure
+        return false;
     }
 
-    DelayMs(5); // Allow time for hardware wakeup
+    DelayMs(10); // Allow time for hardware wakeup
 
     // Exit software shutdown mode via I2C
-    success &= WriteRegister(IS31FL3193_REG_SHUTDOWN, IS31FL3193_SHUTDOWN_SSD_NORMAL);
-
-    // Explicitly disable breathing mode to clear any residual state from previous boot
-    success &= WriteRegister(IS31FL3193_REG_BREATHING, 0x00);
-    success &= WriteRegister(IS31FL3193_REG_LED_MODE, IS31FL3193_LED_MODE_PWM);
-
-    // Clear all PWM channels to ensure no residual colors
-    success &= WriteRegister(IS31FL3193_REG_PWM_CH0, 0x00);
-    success &= WriteRegister(IS31FL3193_REG_PWM_CH1, 0x00);
-    success &= WriteRegister(IS31FL3193_REG_PWM_CH2, 0x00);
-    success &= WriteRegister(IS31FL3193_REG_LED_CONTROL, 0x00);
-    success &= TriggerDataUpdate();
-
-    // Set a default global current
-    success &= SetGlobalCurrent(0x50); // ~10mA
-
-    // Set initial color to off
-    success &= SetRGB(0, 0, 0);
-
-    if (success)
-    {
-        IS31FL3193_LOG_DBG("Device Initialized Successfully.");
-    }
-    else
+    if (!WriteRegister(IS31FL3193_REG_SHUTDOWN, IS31FL3193_SHUTDOWN_SSD_NORMAL))
     {
         IS31FL3193_LOG_ERR("Device Initialization Failed!");
+        return false;
     }
-    return success;
+
+    // Explicitly disable breathing mode to clear any residual state from previous boot
+    if (!WriteRegister(IS31FL3193_REG_BREATHING, 0x00) ||
+        !WriteRegister(IS31FL3193_REG_LED_MODE, IS31FL3193_LED_MODE_PWM))
+    {
+        IS31FL3193_LOG_ERR("Device Initialization Failed!");
+        return false;
+    }
+
+    // Clear all PWM channels to ensure no residual colors
+    if (!WriteRegister(IS31FL3193_REG_PWM_CH0, 0x00) ||
+        !WriteRegister(IS31FL3193_REG_PWM_CH1, 0x00) ||
+        !WriteRegister(IS31FL3193_REG_PWM_CH2, 0x00) ||
+        !WriteRegister(IS31FL3193_REG_LED_CONTROL, 0x00) ||
+        !TriggerDataUpdate())
+    {
+        IS31FL3193_LOG_ERR("Device Initialization Failed!");
+        return false;
+    }
+
+    // Set a default global current
+    if (!SetGlobalCurrent(0x50)) // ~10mA
+    {
+        IS31FL3193_LOG_ERR("Device Initialization Failed!");
+        return false;
+    }
+
+    // Set initial color to off
+    if (!SetRGB(0, 0, 0))
+    {
+        IS31FL3193_LOG_ERR("Device Initialization Failed!");
+        return false;
+    }
+
+    IS31FL3193_LOG_DBG("Device Initialized Successfully.");
+    return true;
 }
 
 /// <summary>
@@ -275,11 +284,13 @@ bool RgbLedPartNumberIs31fl3193::ShutdownDevice()
 bool RgbLedPartNumberIs31fl3193::ResetDevice()
 {
     IS31FL3193_LOG_DBG("Resetting device registers via I2C.");
-    bool success = WriteRegister(IS31FL3193_REG_RESET, IS31FL3193_RESET_VALUE);
+    if (!WriteRegister(IS31FL3193_REG_RESET, IS31FL3193_RESET_VALUE))
+    {
+        return false;
+    }
     DelayMs(2); // Allow time for reset
     // Re-initialize after reset to ensure operational state
-    success &= InitializeDevice();
-    return success;
+    return InitializeDevice();
 }
 
 /// <summary>
@@ -311,13 +322,17 @@ bool RgbLedPartNumberIs31fl3193::SetColorCode(uint32_t colorCode)
 bool RgbLedPartNumberIs31fl3193::SetRGB(uint8_t R, uint8_t G, uint8_t B)
 {
     IS31FL3193_LOG_DBG("Setting RGB: R=%u, G=%u, B=%u", R, G, B);
-    bool success = true;
     this->RED = R;
     this->GREEN = G;
     this->BLUE = B;
-    success &= WritePwmChannel(0, R);
-    success &= WritePwmChannel(1, G);
-    success &= WritePwmChannel(2, B);
+    if (!WritePwmChannel(0, R) ||
+        !WritePwmChannel(1, G) ||
+        !WritePwmChannel(2, B))
+    {
+        IS31FL3193_LOG_ERR("Failed to set RGB values completely.");
+        return false;
+    }
+
     uint8_t ledControl = 0;
     if (R > 0)
         ledControl |= IS31FL3193_LED_CONTROL_CH0_EN;
@@ -325,13 +340,14 @@ bool RgbLedPartNumberIs31fl3193::SetRGB(uint8_t R, uint8_t G, uint8_t B)
         ledControl |= IS31FL3193_LED_CONTROL_CH1_EN;
     if (B > 0)
         ledControl |= IS31FL3193_LED_CONTROL_CH2_EN;
-    success &= WriteLedControlRegister(ledControl);
-    success &= TriggerDataUpdate();
-    if (!success)
+
+    if (!WriteLedControlRegister(ledControl) || !TriggerDataUpdate())
     {
         IS31FL3193_LOG_ERR("Failed to set RGB values completely.");
+        return false;
     }
-    return success;
+
+    return true;
 }
 
 /// <summary>
@@ -373,15 +389,18 @@ bool RgbLedPartNumberIs31fl3193::SetBlue(uint8_t B)
 bool RgbLedPartNumberIs31fl3193::SetBreathingMode(bool enable, uint16_t periodMs)
 {
     IS31FL3193_LOG_DBG("SetBreathingMode: enable=%d, periodMs=%u", enable, periodMs);
-    bool success = true;
 
     if (!enable)
     {
         // Disable breathing mode - return to constant PWM
-        success &= WriteRegister(IS31FL3193_REG_BREATHING, 0x00);
-        success &= WriteRegister(IS31FL3193_REG_LED_MODE, IS31FL3193_LED_MODE_PWM);
+        if (!WriteRegister(IS31FL3193_REG_BREATHING, 0x00) ||
+            !WriteRegister(IS31FL3193_REG_LED_MODE, IS31FL3193_LED_MODE_PWM))
+        {
+            IS31FL3193_LOG_ERR("Failed to configure breathing mode");
+            return false;
+        }
         IS31FL3193_LOG_DBG("Breathing mode disabled");
-        return success;
+        return true;
     }
 
     // IS31FL3193 timing codes: 0=0.13s, 1=0.26s, 2=0.52s, 3=1.04s, 4=2.08s, 5=4.16s, 6=8.32s, 7=16.64s
@@ -427,11 +446,19 @@ bool RgbLedPartNumberIs31fl3193::SetBreathingMode(bool enable, uint16_t periodMs
     // Configure timing for all three channels
     for (uint8_t ch = 0; ch < 3; ch++)
     {
-        success &= ConfigureBreathingTiming(ch, t0_val, t1t2_val, t3t4_val);
+        if (!ConfigureBreathingTiming(ch, t0_val, t1t2_val, t3t4_val))
+        {
+            IS31FL3193_LOG_ERR("Failed to configure breathing mode");
+            return false;
+        }
     }
 
     // Trigger time update to latch timing registers
-    success &= TriggerTimeUpdate();
+    if (!TriggerTimeUpdate())
+    {
+        IS31FL3193_LOG_ERR("Failed to configure breathing mode");
+        return false;
+    }
 
     // Enable breathing on active channels
     uint8_t breathingEnable = 0;
@@ -439,21 +466,21 @@ bool RgbLedPartNumberIs31fl3193::SetBreathingMode(bool enable, uint16_t periodMs
     if (GREEN > 0) breathingEnable |= IS31FL3193_BREATHING_ENABLE_CH1;
     if (BLUE > 0) breathingEnable |= IS31FL3193_BREATHING_ENABLE_CH2;
 
-    success &= WriteRegister(IS31FL3193_REG_BREATHING, breathingEnable);
-
-    // Set LED mode to breathing
-    success &= WriteRegister(IS31FL3193_REG_LED_MODE, IS31FL3193_LED_MODE_BREATHING);
-
-    if (success)
-    {
-        IS31FL3193_LOG_DBG("Breathing mode enabled with T1T2=0x%02X, T3T4=0x%02X", t1t2_val, t3t4_val);
-    }
-    else
+    if (!WriteRegister(IS31FL3193_REG_BREATHING, breathingEnable))
     {
         IS31FL3193_LOG_ERR("Failed to configure breathing mode");
+        return false;
     }
 
-    return success;
+    // Set LED mode to breathing
+    if (!WriteRegister(IS31FL3193_REG_LED_MODE, IS31FL3193_LED_MODE_BREATHING))
+    {
+        IS31FL3193_LOG_ERR("Failed to configure breathing mode");
+        return false;
+    }
+
+    IS31FL3193_LOG_DBG("Breathing mode enabled with T1T2=0x%02X, T3T4=0x%02X", t1t2_val, t3t4_val);
+    return true;
 }
 
 // --- Hardware Standby Control (using IGpioHal) ---

@@ -5,6 +5,7 @@
 #include <string>
 #include <time.h>
 #include <vector> 
+#include <cctype>
 
 static const char* TAG = "ShadowParser";
 
@@ -15,7 +16,50 @@ static constexpr uint32_t MIN_FILL_DWELL_TIME_S   = 300;
 static constexpr uint32_t MIN_WIFI_TIMEOUT_S      = 300;
 static constexpr uint8_t  MIN_FILL_ALARM_DELTA    = 10;
 static constexpr uint32_t MIN_POST_DWELL_TIME_S   = 60;
-static constexpr uint32_t MIN_BLE_ADV_TIME_MS     = 1000;
+static constexpr uint32_t MIN_BLE_ADV_TIME_MS     = 1;
+
+static std::string trimCopy(const std::string& value)
+{
+    size_t first = 0;
+    while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) {
+        first++;
+    }
+
+    size_t last = value.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+        last--;
+    }
+
+    return value.substr(first, last - first);
+}
+
+static bool parseScheduleString(const char* scheduleString, DeviceShadowState& stateOut)
+{
+    if (scheduleString == nullptr) {
+        return false;
+    }
+
+    for (int j = 0; j < MAX_SCHEDULE_ENTRIES; ++j) {
+        stateOut.post_schedule[j].clear();
+    }
+
+    std::string input(scheduleString);
+    int index = 0;
+    size_t start = 0;
+    while (start <= input.size() && index < MAX_SCHEDULE_ENTRIES) {
+        size_t comma = input.find(',', start);
+        std::string token = trimCopy(input.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        if (!token.empty()) {
+            stateOut.post_schedule[index++] = token;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    return index > 0;
+}
 
 bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOut) {
     if (!payload) {
@@ -45,17 +89,21 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
         cJSON* config = configs[i];
         if (!config) continue;
         
-        cJSON* scheduleArray = cJSON_GetObjectItem(config, "post_schedule");
-        if (scheduleArray && cJSON_IsArray(scheduleArray)) {
+        cJSON* schedule = cJSON_GetObjectItem(config, "post_schedule");
+        if (schedule && cJSON_IsString(schedule) && schedule->valuestring != NULL) {
+            if (parseScheduleString(schedule->valuestring, stateOut)) {
+                success = true;
+            }
+        } else if (schedule && cJSON_IsArray(schedule)) {
             for(int j = 0; j < MAX_SCHEDULE_ENTRIES; ++j) {
                 stateOut.post_schedule[j].clear();
             }
 
             int index = 0;
             cJSON* scheduleItem;
-            cJSON_ArrayForEach(scheduleItem, scheduleArray) {
+            cJSON_ArrayForEach(scheduleItem, schedule) {
                 if (index < MAX_SCHEDULE_ENTRIES && cJSON_IsString(scheduleItem) && (scheduleItem->valuestring != NULL)) {
-                    stateOut.post_schedule[index] = scheduleItem->valuestring;
+                    stateOut.post_schedule[index] = trimCopy(scheduleItem->valuestring);
                     index++;
                 }
             }
@@ -107,6 +155,44 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
             else { stateOut.ble_adv_time = v; success = true; }
         }
 
+        item = cJSON_GetObjectItem(config, "mqtt_scheduled_post");
+        if (item && cJSON_IsString(item) && item->valuestring != NULL) {
+            stateOut.mqtt_scheduled_post = trimCopy(item->valuestring);
+            success = true;
+        }
+
+        item = cJSON_GetObjectItem(config, "event_posts");
+        if (item && cJSON_IsBool(item)) {
+            stateOut.event_posts = cJSON_IsTrue(item);
+            stateOut.event_posts_valid = true;
+            success = true;
+        }
+
+        item = cJSON_GetObjectItem(config, "event_thresholds_pct");
+        if (item && cJSON_IsString(item) && item->valuestring != NULL) {
+            stateOut.event_thresholds_pct = trimCopy(item->valuestring);
+            success = true;
+        }
+
+        item = cJSON_GetObjectItem(config, "sensor_sample_rate");
+        if (item && cJSON_IsNumber(item)) {
+            stateOut.sensor_sample_rate = (uint32_t)item->valueint;
+            success = true;
+        }
+
+        item = cJSON_GetObjectItem(config, "acquire_gps");
+        if (item && cJSON_IsBool(item)) {
+            stateOut.acquire_gps = cJSON_IsTrue(item);
+            stateOut.acquire_gps_valid = true;
+            success = true;
+        }
+
+        item = cJSON_GetObjectItem(config, "mqtt_timeout");
+        if (item && cJSON_IsNumber(item)) {
+            stateOut.mqtt_timeout = (uint32_t)item->valueint;
+            success = true;
+        }
+
         item = cJSON_GetObjectItem(config, "fota_enabled");
         if (item && cJSON_IsBool(item)) { stateOut.fota_enabled = cJSON_IsTrue(item); }
     }
@@ -122,12 +208,14 @@ std::string CreateEnhancedShadowUpdate(const DeviceShadowState& state, const Log
     cJSON* reported = cJSON_CreateObject();
 
     // 1. Post Schedule
-    std::vector<const char*> c_str_vector;
+    std::string scheduleString;
     for(int i = 0; i < MAX_SCHEDULE_ENTRIES; ++i) {
-        c_str_vector.push_back(state.post_schedule[i].c_str());
+        if (i > 0) {
+            scheduleString += ",";
+        }
+        scheduleString += state.post_schedule[i].empty() ? "00:00;00" : state.post_schedule[i];
     }
-    cJSON* scheduleArray = cJSON_CreateStringArray(c_str_vector.data(), c_str_vector.size());
-    cJSON_AddItemToObject(reported, "post_schedule", scheduleArray);
+    cJSON_AddStringToObject(reported, "post_schedule", scheduleString.c_str());
 
     // 2. Configuration values
     cJSON_AddNumberToObject(reported, "fill_dwell_time", state.fill_dwell_time);
@@ -138,6 +226,12 @@ std::string CreateEnhancedShadowUpdate(const DeviceShadowState& state, const Log
     cJSON_AddNumberToObject(reported, "fill_alarm_delta", state.fill_alarm_delta);
     cJSON_AddNumberToObject(reported, "post_dwell_time", state.post_dwell_time);
     cJSON_AddNumberToObject(reported, "ble_adv_time", state.ble_adv_time);
+    if (!state.mqtt_scheduled_post.empty()) cJSON_AddStringToObject(reported, "mqtt_scheduled_post", state.mqtt_scheduled_post.c_str());
+    if (state.event_posts_valid) cJSON_AddBoolToObject(reported, "event_posts", state.event_posts);
+    if (!state.event_thresholds_pct.empty()) cJSON_AddStringToObject(reported, "event_thresholds_pct", state.event_thresholds_pct.c_str());
+    if (state.sensor_sample_rate != 0) cJSON_AddNumberToObject(reported, "sensor_sample_rate", state.sensor_sample_rate);
+    if (state.acquire_gps_valid) cJSON_AddBoolToObject(reported, "acquire_gps", state.acquire_gps);
+    if (state.mqtt_timeout != 0) cJSON_AddNumberToObject(reported, "mqtt_timeout", state.mqtt_timeout);
 
     // NOTE: All old fields like 'postingConfig', 'fotaConfig', and 'deviceStatus'
     // are now intentionally omitted to create the clean format you want.
@@ -182,6 +276,32 @@ void MergeShadowDelta(DeviceShadowState& currentState, const DeviceShadowState& 
     if (deltaState.ble_adv_time != 0) {
         currentState.ble_adv_time = deltaState.ble_adv_time;
         ESP_LOGI(TAG, "Updated ble_adv_time to %u ms", (unsigned int)currentState.ble_adv_time);
+    }
+    if (!deltaState.mqtt_scheduled_post.empty()) {
+        currentState.mqtt_scheduled_post = deltaState.mqtt_scheduled_post;
+        ESP_LOGI(TAG, "Updated mqtt_scheduled_post to %s", currentState.mqtt_scheduled_post.c_str());
+    }
+    if (!deltaState.event_thresholds_pct.empty()) {
+        currentState.event_thresholds_pct = deltaState.event_thresholds_pct;
+        ESP_LOGI(TAG, "Updated event_thresholds_pct to %s", currentState.event_thresholds_pct.c_str());
+    }
+    if (deltaState.sensor_sample_rate != 0) {
+        currentState.sensor_sample_rate = deltaState.sensor_sample_rate;
+        ESP_LOGI(TAG, "Updated sensor_sample_rate to %u", (unsigned int)currentState.sensor_sample_rate);
+    }
+    if (deltaState.mqtt_timeout != 0) {
+        currentState.mqtt_timeout = deltaState.mqtt_timeout;
+        ESP_LOGI(TAG, "Updated mqtt_timeout to %u", (unsigned int)currentState.mqtt_timeout);
+    }
+    if (deltaState.event_posts_valid) {
+        currentState.event_posts = deltaState.event_posts;
+        currentState.event_posts_valid = true;
+        ESP_LOGI(TAG, "Updated event_posts to %s", currentState.event_posts ? "true" : "false");
+    }
+    if (deltaState.acquire_gps_valid) {
+        currentState.acquire_gps = deltaState.acquire_gps;
+        currentState.acquire_gps_valid = true;
+        ESP_LOGI(TAG, "Updated acquire_gps to %s", currentState.acquire_gps ? "true" : "false");
     }
 }
 

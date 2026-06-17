@@ -168,6 +168,7 @@ private:
     // pattern changes. Prevents an unreachable LED (dead/clamped bus) from
     // spamming errors forever and starving/crashing the system.
     static constexpr int LED_MAX_CONSECUTIVE_I2C_FAILURES = 3;
+    static constexpr int LED_INIT_MAX_ATTEMPTS = 2;
 
     volatile LedState _ledTaskState = LedState::LedState_Off;
     volatile uint8_t _ledTaskR = 0;
@@ -177,6 +178,7 @@ private:
     I2cBusRecoveryHook _i2cBusRecoveryHook = nullptr;
 
     void EnsureLedTask();
+    bool InitializeLedWithRecovery(const char* context);
     static void LedTaskTrampoline(void* arg);
     void LedTaskLoop();
 };

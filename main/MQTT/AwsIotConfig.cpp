@@ -48,7 +48,7 @@ extern "C" bool AwsIotConfig_Init(const char* thingName)
     strncpy(s_thing, thingName, sizeof(s_thing) - 1);
     s_thing[sizeof(s_thing) - 1] = '\0';
 
-    snprintf(s_telemetry,              TOPIC_BUF, "dt/propane-tank/%s/telemetry",          s_thing);
+    snprintf(s_telemetry,              TOPIC_BUF, "logi4wifi/device/%s",                   s_thing);
     snprintf(s_shadow_get,             TOPIC_BUF, "$aws/things/%s/shadow/get",             s_thing);
     snprintf(s_shadow_get_accepted,    TOPIC_BUF, "$aws/things/%s/shadow/get/accepted",    s_thing);
     snprintf(s_shadow_get_rejected,    TOPIC_BUF, "$aws/things/%s/shadow/get/rejected",    s_thing);

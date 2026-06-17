@@ -3,10 +3,14 @@
 #include "LogiSensorData.h"
 #include "AwsIotConfig.h"
 #include "ShadowParser.h"
+#include "logi/ResetCounter.h"
 #include "esp_log.h"
 #include "esp_secure_cert_read.h"
+#include "esp_wifi.h"
 #include "mqtt_client.h"
+#include "sdkconfig.h"
 #include "cJSON.h"
+#include <cmath>
 #include <cstring>
 
 // AWS Root CA Certificate - Amazon Root CA 1
@@ -37,6 +41,11 @@ rqXRfboQnoZsG4q5WTP468SQvvG5
 // AwsIotClient::Initialize() pulls them via esp_secure_cert_mgr.
 
 const char* AwsIotClient::TAG = "AwsIotClient";
+
+static double roundToTwoDecimals(float value)
+{
+    return std::round(static_cast<double>(value) * 100.0) / 100.0;
+}
 
 AwsIotClient::AwsIotClient()
     : mqtt_client(nullptr),
@@ -360,21 +369,66 @@ std::string AwsIotClient::createTelemetryJson(const LogiSensorData& data)
 {
     cJSON* root = cJSON_CreateObject();
 
-    // Add timestamp
+    if (AWS_IOT_THING_NAME != nullptr && AWS_IOT_THING_NAME[0] != '\0') {
+        cJSON_AddStringToObject(root, "dev", AWS_IOT_THING_NAME);
+    }
+
     time_t now;
     time(&now);
-    cJSON_AddNumberToObject(root, "timestamp", now);
+    if (now >= 1609459200) {
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        char timestamp[32];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S.000", &timeinfo);
+        cJSON_AddStringToObject(root, "dts", timestamp);
+    }
 
-    // Add sensor data
-    cJSON_AddNumberToObject(root, "temperature_c", data.MeasuredTemperatureC);
-    cJSON_AddNumberToObject(root, "humidity_percent", data.MeasuredHumidityPercentage);
-    cJSON_AddNumberToObject(root, "battery_level", data.PublishedBatteryLevel);
-    cJSON_AddNumberToObject(root, "fuel_level", data.PublishedFuelLevel);
-    cJSON_AddNumberToObject(root, "battery_voltage", data.AnalogBatteryVoltage);
-    cJSON_AddNumberToObject(root, "fuel_voltage", data.AnalogFuelVoltage);
-    cJSON_AddNumberToObject(root, "solar_voltage", data.SolarVoltage);
-    cJSON_AddNumberToObject(root, "battery_temp_c", data.BatteryTemperatureC);
-    cJSON_AddNumberToObject(root, "sensor_supply_voltage", data.SensorSupplyVoltage);
+    char schema[16];
+    snprintf(schema, sizeof(schema), "%d.%d.%d",
+             CONFIG_LOGI_MQTT_VERSION_MAJOR,
+             CONFIG_LOGI_MQTT_VERSION_MINOR,
+             CONFIG_LOGI_MQTT_VERSION_REVISION);
+    cJSON_AddStringToObject(root, "sch", schema);
+
+    char version[64];
+    snprintf(version, sizeof(version), "%d.%d,%d.%d,%d.%d.%d",
+             CONFIG_LOGI_HARDWARE_VERSION_MAJOR,
+             CONFIG_LOGI_HARDWARE_VERSION_MINOR,
+             CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
+             CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
+             CONFIG_LOGI_MQTT_VERSION_MAJOR,
+             CONFIG_LOGI_MQTT_VERSION_MINOR,
+             CONFIG_LOGI_MQTT_VERSION_REVISION);
+    cJSON_AddStringToObject(root, "ver", version);
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        cJSON_AddNumberToObject(root, "lsq", ap_info.rssi);
+    }
+
+    cJSON_AddNumberToObject(root, "bat", data.AnalogBatteryVoltage);
+    cJSON_AddNumberToObject(root, "ful", data.PublishedFuelLevel);
+    cJSON_AddNumberToObject(root, "amb", data.MeasuredTemperatureC);
+    cJSON_AddNumberToObject(root, "sol", data.SolarVoltage);
+    cJSON_AddNumberToObject(root, "chg", data.PublishedBatteryLevel);
+    cJSON_AddNumberToObject(root, "rst", LogiResetCounter_Get());
+    cJSON_AddNumberToObject(root, "lat", data.GPSData.latitude);
+    cJSON_AddNumberToObject(root, "lon", data.GPSData.longitude);
+    cJSON_AddNumberToObject(root, "alt", data.GPSData.altitude);
+
+    char gpsQuality[32];
+    snprintf(gpsQuality, sizeof(gpsQuality), "%d,0", data.GPSData.rssi);
+    cJSON_AddStringToObject(root, "gsq", gpsQuality);
+    cJSON_AddStringToObject(root, "err", "");
+    cJSON_AddNumberToObject(root, "raw", roundToTwoDecimals(data.AnalogFuelVoltage));
+    cJSON_AddNumberToObject(root, "supv", roundToTwoDecimals(data.SensorSupplyVoltage));
+
+    cJSON_AddStringToObject(root, "psch", "00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00");
+    cJSON_AddNumberToObject(root, "fdt", 0);
+    cJSON_AddNumberToObject(root, "wto", 0);
+    cJSON_AddNumberToObject(root, "bleadv", 0);
+    cJSON_AddNumberToObject(root, "fpd", 0);
+    cJSON_AddNumberToObject(root, "pdt", 0);
 
     char* json_str = cJSON_PrintUnformatted(root);
     std::string result(json_str);
@@ -387,103 +441,72 @@ std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& d
 {
     cJSON* root = cJSON_CreateObject();
 
-    // === Identification ===
     if (ctx.deviceIdValid)
     {
-        cJSON_AddStringToObject(root, "DeviceId", ctx.deviceId);
-    }
-    if (ctx.imeiValid)
-    {
-        cJSON_AddStringToObject(root, "Imei", ctx.imei);
-    }
-    if (ctx.iccidValid)
-    {
-        cJSON_AddStringToObject(root, "Iccid", ctx.iccid);
+        cJSON_AddStringToObject(root, "dev", ctx.deviceId);
     }
 
-    // === Timestamps & Versioning ===
     if (ctx.dateTimeIsoValid)
     {
-        cJSON_AddStringToObject(root, "DateTimeIso", ctx.dateTimeIso);
+        cJSON_AddStringToObject(root, "dts", ctx.dateTimeIso);
     }
     if (ctx.mqttSchemaValid)
     {
-        cJSON_AddStringToObject(root, "MqttSchema", ctx.mqttSchema);
+        cJSON_AddStringToObject(root, "sch", ctx.mqttSchema);
     }
     if (ctx.deviceVersionValid)
     {
-        cJSON_AddStringToObject(root, "DeviceVersion", ctx.deviceVersion);
-    }
-    if (ctx.modemFirmwareVersionValid)
-    {
-        cJSON_AddStringToObject(root, "ModemFirmwareVersion", ctx.modemFirmwareVersion);
+        cJSON_AddStringToObject(root, "ver", ctx.deviceVersion);
     }
 
-    // === Sensor Data (always valid from LogiSensorData) ===
-    cJSON_AddNumberToObject(root, "FuelLevel", data.PublishedFuelLevel);
-    cJSON_AddNumberToObject(root, "RawLevelCounts", data.AnalogFuelVoltage);
-    cJSON_AddNumberToObject(root, "SupplyVoltage", data.SensorSupplyVoltage);
-    cJSON_AddNumberToObject(root, "BatteryVolts", data.AnalogBatteryVoltage);
-    cJSON_AddNumberToObject(root, "BatteryTemperature", data.BatteryTemperatureC);
-    cJSON_AddNumberToObject(root, "SolarVolts", data.SolarVoltage);
-    cJSON_AddNumberToObject(root, "TempC", static_cast<int32_t>(data.MeasuredTemperatureC));
-
-    // === Location (GPS) ===
-    cJSON_AddNumberToObject(root, "Latitude", data.GPSData.latitude);
-    cJSON_AddNumberToObject(root, "Longitude", data.GPSData.longitude);
-    cJSON_AddNumberToObject(root, "Altitude", data.GPSData.altitude);
-
-    // GPS Signal Quality - format as "HDOP,VDOP,PDOP" (simplified for now)
-    char gpsQuality[32];
-    snprintf(gpsQuality, sizeof(gpsQuality), "%d,0,0", data.GPSData.rssi);
-    cJSON_AddStringToObject(root, "GpsSignalQuality", gpsQuality);
-
-    // === Network & Status ===
     if (ctx.lteSignalQualityValid)
     {
-        cJSON_AddNumberToObject(root, "LteSignalQuality", ctx.lteSignalQuality);
-    }
-    if (ctx.chargerStatusValid)
-    {
-        cJSON_AddNumberToObject(root, "ChargerStatus", ctx.chargerStatus);
-    }
-    if (ctx.bleStatusValid)
-    {
-        cJSON_AddNumberToObject(root, "BleStatus", ctx.bleStatus);
-    }
-    if (ctx.deviceStatusValid)
-    {
-        cJSON_AddNumberToObject(root, "DeviceStatus", ctx.deviceStatus);
-    }
-    if (ctx.errorLogValid)
-    {
-        cJSON_AddStringToObject(root, "ErrorLog", ctx.errorLog);
-    }
-    if (ctx.resetCounterValid)
-    {
-        cJSON_AddNumberToObject(root, "ResetCounter", ctx.resetCounter);
+        cJSON_AddNumberToObject(root, "lsq", ctx.lteSignalQuality);
     }
 
-    // === Configuration Echo ===
+    cJSON_AddNumberToObject(root, "bat", data.AnalogBatteryVoltage);
+    cJSON_AddNumberToObject(root, "ful", data.PublishedFuelLevel);
+    cJSON_AddNumberToObject(root, "amb", data.MeasuredTemperatureC);
+    cJSON_AddNumberToObject(root, "sol", data.SolarVoltage);
+    cJSON_AddNumberToObject(root, "chg", data.PublishedBatteryLevel);
+    if (ctx.resetCounterValid)
+    {
+        cJSON_AddNumberToObject(root, "rst", ctx.resetCounter);
+    }
+    cJSON_AddNumberToObject(root, "lat", data.GPSData.latitude);
+    cJSON_AddNumberToObject(root, "lon", data.GPSData.longitude);
+    cJSON_AddNumberToObject(root, "alt", data.GPSData.altitude);
+
+    char gpsQuality[32];
+    snprintf(gpsQuality, sizeof(gpsQuality), "%d,0", data.GPSData.rssi);
+    cJSON_AddStringToObject(root, "gsq", gpsQuality);
+    cJSON_AddStringToObject(root, "err", ctx.errorLogValid ? ctx.errorLog : "");
+    cJSON_AddNumberToObject(root, "raw", roundToTwoDecimals(data.AnalogFuelVoltage));
+    cJSON_AddNumberToObject(root, "supv", roundToTwoDecimals(data.SensorSupplyVoltage));
+
     if (ctx.postingScheduleValid)
     {
-        cJSON_AddStringToObject(root, "PostingSchedule", ctx.postingSchedule);
+        cJSON_AddStringToObject(root, "psch", ctx.postingSchedule);
     }
     if (ctx.fillDwellTimeValid)
     {
-        cJSON_AddNumberToObject(root, "FillDwellTime", ctx.fillDwellTime);
+        cJSON_AddNumberToObject(root, "fdt", ctx.fillDwellTime);
     }
     if (ctx.fillPostDeltaValueValid)
     {
-        cJSON_AddNumberToObject(root, "FillPostDeltaValue", ctx.fillPostDeltaValue);
-    }
-    if (ctx.lteAttemptTimeoutValid)
-    {
-        cJSON_AddNumberToObject(root, "LteAttemptTimeout", ctx.lteAttemptTimeout);
+        cJSON_AddNumberToObject(root, "fpd", ctx.fillPostDeltaValue);
     }
     if (ctx.postDwellTimeValid)
     {
-        cJSON_AddNumberToObject(root, "PostDwellTime", ctx.postDwellTime);
+        cJSON_AddNumberToObject(root, "pdt", ctx.postDwellTime);
+    }
+    if (ctx.lteAttemptTimeoutValid)
+    {
+        cJSON_AddNumberToObject(root, "wto", ctx.lteAttemptTimeout);
+    }
+    if (ctx.bleAdvTimeValid)
+    {
+        cJSON_AddNumberToObject(root, "bleadv", ctx.bleAdvTime);
     }
 
     char* json_str = cJSON_PrintUnformatted(root);

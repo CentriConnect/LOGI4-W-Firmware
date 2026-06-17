@@ -6,7 +6,9 @@
 #include <esp_timer.h>
 #include <esp_sleep.h>
 #include <wifi_provisioning/scheme_ble.h>
+#include <ctime>
 #include <cstring>
+#include "logi/ResetCounter.h"
 
 ESP_EVENT_DECLARE_BASE(LOGI_PROV_TIMEOUT_EVENT);
 ESP_EVENT_DEFINE_BASE(LOGI_PROV_TIMEOUT_EVENT);
@@ -20,18 +22,21 @@ const char* ProvisioningStateMachine::NVS_WIFI_SSID_KEY = "wifi_ssid";
 const char* ProvisioningStateMachine::NVS_WIFI_PASS_KEY = "wifi_pass";
 const char* ProvisioningStateMachine::NVS_BACKUP_SSID_KEY = "backup_ssid";
 const char* ProvisioningStateMachine::NVS_BACKUP_PASS_KEY = "backup_pass";
+static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
 
 ProvisioningStateMachine::ProvisioningStateMachine(EspNvsStorage* nvsStorage,
                                                    EspBluetoothManager* bleManager,
                                                    ILogiHardwareDriver* driver,
                                                    AwsIotManager* awsIotManager,
                                                    EspPowerManager* powerManager,
+                                                   EspTimeKeeper* timeKeeper,
                                                    DeviceSettings* deviceSettings)
     : _nvsStorage(nvsStorage)
     , _bleManager(bleManager)
     , _driver(driver)
     , _awsIotManager(awsIotManager)
     , _powerManager(powerManager)
+    , _timeKeeper(timeKeeper)
     , _deviceSettings(deviceSettings)
 {
 }
@@ -252,6 +257,15 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
     // Test AWS IoT connection (Req #3). REQ-FIRSTBOOT-01: keep the connection
     // alive so the PostJobsShadow state can reuse it for the 4-step sequence
     // (Disconnect happens at the end of that state).
+    if (_timeKeeper != nullptr && !_timeKeeper->IsTimeSynced()) {
+        ESP_LOGI(TAG, "Synchronizing UTC time before AWS IoT TLS/MQTT connect...");
+        if (!_timeKeeper->SyncTime()) {
+            ESP_LOGE(TAG, "NTP sync failed before AWS IoT connect - staying in provisioning");
+            transitionTo(ProvisioningState::ProvisioningState_Failed);
+            return;
+        }
+    }
+
     ESP_LOGI(TAG, "Testing AWS IoT connection...");
     if (_awsIotManager && _awsIotManager->Connect()) {
         ESP_LOGI(TAG, "AWS IoT connection verified — keeping connection for first-boot sequence");
@@ -269,9 +283,6 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
 
     // Green LED blink starts now (covers both the first-boot sequence and the
     // 30-min display window — single transition for the user-visible cue).
-    if (_driver) {
-        _driver->SetLedState(LedState::LedState_GreenBlink);
-    }
     ESP_LOGI(TAG, "Provisioning successful — running first-boot sequence then %d-min display",
              CONFIG_LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN);
 
@@ -302,6 +313,9 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
     if (!_awsIotManager) {
         ESP_LOGE(TAG, "REQ-FIRSTBOOT-01: no AwsIotManager — skipping sequence");
         _successDisplayStartMs = esp_timer_get_time() / 1000;
+        if (_driver) {
+            _driver->SetLedState(LedState::LedState_GreenBlink);
+        }
         transitionTo(ProvisioningState::ProvisioningState_SuccessDisplay);
         return;
     }
@@ -330,7 +344,9 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [1/4]: initial POST");
         if (client) {
             LogiSensorData sd{};
-            bool ok = client->PublishTelemetry(sd);
+            TelemetryContext context{};
+            populateFirstBootTelemetryContext(context, sd);
+            bool ok = client->PublishTelemetryLogi4Format(sd, context);
             ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [1/4]: POST %s", ok ? "ok" : "FAILED");
         } else {
             ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [1/4]: no client — skipped");
@@ -376,8 +392,7 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
     case 3: {
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [4/4]: confirming POST after shadow apply");
         if (client) {
-            LogiSensorData sd{};
-            bool ok = client->PublishTelemetry(sd);
+            bool ok = publishFirstBootTelemetry(client);
             ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [4/4]: POST %s", ok ? "ok" : "FAILED");
         }
         _firstBootSubStep = 4;
@@ -389,6 +404,9 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01: sequence complete — disconnecting AWS");
         _awsIotManager->Disconnect();
         _successDisplayStartMs = esp_timer_get_time() / 1000;
+        if (_driver) {
+            _driver->SetLedState(LedState::LedState_GreenBlink);
+        }
         transitionTo(ProvisioningState::ProvisioningState_SuccessDisplay);
         break;
     }
@@ -575,14 +593,120 @@ esp_err_t ProvisioningStateMachine::getDeviceServiceName(char* serviceName, size
 
 esp_err_t ProvisioningStateMachine::getDevicePop(char* pop, size_t maxLen)
 {
-    uint8_t mac[6];
-    esp_err_t err = esp_wifi_get_mac(WIFI_IF_STA, mac);
-    if (err != ESP_OK) {
-        return err;
+    if (pop == nullptr || maxLen < strlen(LOGI_PROVISIONING_POP) + 1) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    snprintf(pop, maxLen, "%02X%02X%02X%02X", mac[2], mac[3], mac[4], mac[5]);
+    snprintf(pop, maxLen, "%s", LOGI_PROVISIONING_POP);
     return ESP_OK;
+}
+
+bool ProvisioningStateMachine::publishFirstBootTelemetry(AwsIotClient* client)
+{
+    if (client == nullptr) {
+        return false;
+    }
+
+    LogiSensorData sensorData{};
+    if (_driver != nullptr) {
+        _driver->UpdateMeasurements();
+        _driver->GetLatestSensorData(sensorData);
+    }
+
+    TelemetryContext context{};
+    populateFirstBootTelemetryContext(context, sensorData);
+    return client->PublishTelemetryLogi4Format(sensorData, context);
+}
+
+void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContext& ctx, const LogiSensorData& data) const
+{
+    memset(&ctx, 0, sizeof(TelemetryContext));
+
+    if (_deviceSettings != nullptr) {
+        char deviceId[DeviceSettings::DEVICE_ID_BUFFER_SIZE];
+        if (_deviceSettings->getDeviceId(deviceId, sizeof(deviceId)) && _deviceSettings->isDeviceIdValid()) {
+            strncpy(ctx.deviceId, deviceId, sizeof(ctx.deviceId) - 1);
+            ctx.deviceId[sizeof(ctx.deviceId) - 1] = '\0';
+            ctx.deviceIdValid = true;
+        }
+
+        WeeklySchedule schedules[DeviceSettings::MAX_WEEKLY_SCHEDULES];
+        _deviceSettings->getWeeklySchedules(schedules);
+
+        char* schedPtr = ctx.postingSchedule;
+        size_t schedRemaining = sizeof(ctx.postingSchedule);
+        int written = 0;
+
+        for (size_t i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES && schedRemaining > 20; i++) {
+            uint8_t dayByteWithEnable = 0;
+            uint8_t hour = 0;
+            uint8_t minute = 0;
+
+            if (schedules[i].DaysOfWeek != 0) {
+                dayByteWithEnable = schedules[i].DaysOfWeek | 0x80;
+                hour = schedules[i].StartTime.Hour;
+                minute = schedules[i].StartTime.Minute;
+            }
+
+            written = snprintf(schedPtr, schedRemaining, "%s%02d:%02d;%02X",
+                               i == 0 ? "" : ", ",
+                               hour,
+                               minute,
+                               dayByteWithEnable);
+            schedPtr += written;
+            schedRemaining -= written;
+        }
+        ctx.postingScheduleValid = true;
+
+        ctx.fillDwellTime = _deviceSettings->getFillDwellTime();
+        ctx.fillDwellTimeValid = true;
+        ctx.lteAttemptTimeout = _deviceSettings->getLteTimeout();
+        ctx.lteAttemptTimeoutValid = true;
+        ctx.bleAdvTime = _deviceSettings->getBleAdvTime();
+        ctx.bleAdvTimeValid = true;
+        ctx.fillPostDeltaValue = _deviceSettings->getFillAlarmDelta();
+        ctx.fillPostDeltaValueValid = true;
+        ctx.postDwellTime = _deviceSettings->getPostDwellTime();
+        ctx.postDwellTimeValid = true;
+    }
+
+    time_t now;
+    time(&now);
+    if (now >= 1609459200) {
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        strftime(ctx.dateTimeIso, sizeof(ctx.dateTimeIso), "%Y-%m-%dT%H:%M:%S.000", &timeinfo);
+        ctx.dateTimeIsoValid = true;
+    }
+
+    snprintf(ctx.mqttSchema, sizeof(ctx.mqttSchema), "%d.%d.%d",
+             CONFIG_LOGI_MQTT_VERSION_MAJOR,
+             CONFIG_LOGI_MQTT_VERSION_MINOR,
+             CONFIG_LOGI_MQTT_VERSION_REVISION);
+    ctx.mqttSchemaValid = true;
+
+    snprintf(ctx.deviceVersion, sizeof(ctx.deviceVersion), "%d.%d,%d.%d,%d.%d.%d",
+             CONFIG_LOGI_HARDWARE_VERSION_MAJOR,
+             CONFIG_LOGI_HARDWARE_VERSION_MINOR,
+             CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
+             CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
+             CONFIG_LOGI_MQTT_VERSION_MAJOR,
+             CONFIG_LOGI_MQTT_VERSION_MINOR,
+             CONFIG_LOGI_MQTT_VERSION_REVISION);
+    ctx.deviceVersionValid = true;
+
+    wifi_ap_record_t apInfo;
+    if (esp_wifi_sta_get_ap_info(&apInfo) == ESP_OK) {
+        ctx.lteSignalQuality = apInfo.rssi;
+        ctx.lteSignalQualityValid = true;
+    }
+
+    ctx.chargerStatus = data.PublishedBatteryLevel;
+    ctx.chargerStatusValid = true;
+    ctx.resetCounter = LogiResetCounter_Get();
+    ctx.resetCounterValid = true;
+    ctx.errorLog[0] = '\0';
+    ctx.errorLogValid = true;
 }
 
 // ============================================================================

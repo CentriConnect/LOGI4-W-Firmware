@@ -43,11 +43,11 @@ menu "Featured FreeRTOS IoT Integration"
                 help
                     REQ-SHADOW: BLE advertising interval (ms) used during the 48h
                     provisioning window. Shadow-controllable via 'ble_adv_time'.
-                    REV B min 1000.
+                    LOGI4W cloud payloads commonly use values such as 120.
 
             config LOGI_MIN_BLE_ADV_TIME_MS
                 int "Minimum BLE ADV interval (ms) — shadow values below this are rejected"
-                default 1000
+                default 1
 
             config LOGI_DEFAULT_POST_DWELL_TIME_S
                 int "The minimum time, in seconds, that the fuel level must remain above the fill threshold to trigger a 'fill' event."
@@ -191,15 +191,15 @@ menu "Featured FreeRTOS IoT Integration"
 
             config LOGI_SOFTWARE_VERSION_MAJOR
                 int "LOGI CELL firmware major version"
-                default 1
+                default 0
 
             config LOGI_SOFTWARE_VERSION_MINOR
                 int "LOGI CELL firmware minor version"
-                default 2
+                default 0
 
             config LOGI_SOFTWARE_VERSION_REVISION
                 int "LOGI CELL firmware revision"
-                default 1
+                default 0
 
             config LOGI_HARDWARE_VERSION_MAJOR
                 int "LOGI CELL hardware major version"
@@ -215,7 +215,7 @@ menu "Featured FreeRTOS IoT Integration"
 
             config LOGI_MQTT_VERSION_MAJOR
                 int "LOGI CELL MQTT major version"
-                default 3
+                default 4
 
             config LOGI_MQTT_VERSION_MINOR
                 int "LOGI CELL MQTT minor version"
@@ -672,5 +672,3 @@ menu "Featured FreeRTOS IoT Integration"
     endmenu # OTA demo configurations
 
 endmenu # Golden Reference Integration
-
-

@@ -43,12 +43,15 @@ enum class PostingState
     PostingState_InitialEnter,
     PostingState_ExitAWS,
     PostingState_TryConnect,
+    PostingState_PostImmediateTelemetry,
     PostingState_SubscribeToTopics,
     PostingState_SendGetShadowDelta,
     PostingState_GotShadowDelta,
     PostingState_HandleShadowDelta,
     PostingState_CheckFOTA,
     PostingState_DoFOTAUpdate,
+    PostingState_AcquireFinalSample,
+    PostingState_PostFinalTelemetry,
     PostingState_DoPostsFromQueue,
     PostingState_PostDwell          // Wait after successful post for cloud commands/OTA
 };

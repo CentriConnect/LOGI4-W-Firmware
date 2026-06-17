@@ -62,6 +62,7 @@ struct TelemetryContext
     uint8_t fillPostDeltaValue;
     uint32_t lteAttemptTimeout;
     uint32_t postDwellTime;
+    uint32_t bleAdvTime;
 
     // Validity flags (only fields marked valid are included in JSON)
     bool deviceIdValid;
@@ -82,6 +83,7 @@ struct TelemetryContext
     bool fillPostDeltaValueValid;
     bool lteAttemptTimeoutValid;
     bool postDwellTimeValid;
+    bool bleAdvTimeValid;
 };
 
 #endif // LOGI_SENSOR_DATA_H_

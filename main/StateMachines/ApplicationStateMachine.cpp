@@ -19,6 +19,7 @@ static constexpr uint8_t AUTH_FAILURE_THRESHOLD = 10;
 #include "ScheduleCheckStateMachine.h"
 #include "PostingStateMachine.h"
 #include "logi/EspLogiHardwareFactory.h"
+#include "logi/ResetCounter.h"
 
 static const char *TAG = "ApplicationStateMachine";
 static const char *NVS_LAST_FUEL_KEY = "lastFuelLvl";
@@ -64,6 +65,9 @@ ApplicationStateMachine::~ApplicationStateMachine() = default;
 bool ApplicationStateMachine::init()
 {
     ESP_LOGI(TAG, "Initializing Application State Machine...");
+
+    LogiResetCounter_Init();
+    ESP_LOGI(TAG, "Reset counter: %u", static_cast<unsigned int>(LogiResetCounter_Get()));
 
     if (!_stateStorage.Init()) {
         ESP_LOGE(TAG, "State NVS Storage Initialization Failed!");
@@ -112,17 +116,8 @@ bool ApplicationStateMachine::init()
     }
     ESP_LOGI(TAG, "Logi Hardware Driver Initialized.");
 
-    // REQ-LED-01: Power Manager moved ahead of Network so we can check the wake
-    // reason and blink the "powered on" LED BEFORE the blocking Wi-Fi connect
-    // (which can take up to 30 s on a slow/unreachable AP). Gated to true
-    // power-on/reset so it does not flash on every deep-sleep wake.
     _powerManager = std::make_unique<EspPowerManager>();
     ESP_LOGI(TAG, "Power Manager Initialized.");
-
-    if (_powerManager->GetWakeupReason() == WAKEUP_REASON_RESET) {
-        ESP_LOGI(TAG, "Power-on boot - showing 'powered on' LED (yellow, early)");
-        _logiHardwareDriver->BlinkLed(LedState::LedState_YellowBlink, 3, 200, 200);
-    }
 
     _networkManager = std::make_unique<EspNetworkManager>();
     if (!_networkManager->Initialize()) {
@@ -156,6 +151,7 @@ bool ApplicationStateMachine::init()
         _logiHardwareDriver.get(),
         &_awsIotManager,
         _powerManager.get(),
+        &_timeKeeper,
         &_deviceSettings  // REQ-BLE-01
     );
     ESP_LOGI(TAG, "Provisioning State Machine created.");
@@ -261,26 +257,9 @@ bool ApplicationStateMachine::init()
         }
     }
 
-    // REQ-LED-01: Yellow "powered on" blink moved above (early, before Wi-Fi
-    // connect). Only the green/red Wi-Fi-result blink remains here.
     WakeupReason wakeup_reason = _powerManager->GetWakeupReason();
     if (wakeup_reason == WAKEUP_REASON_RESET)
     {
-        ESP_LOGI(TAG, "Power-on boot - showing Wi-Fi connection result LED");
-
-        // Green if connected, red if not
-        if (connect_success)
-        {
-            _logiHardwareDriver->BlinkLed(LedState::LedState_GreenBlink, 3, 200, 200);
-        }
-        else
-        {
-            _logiHardwareDriver->BlinkLed(LedState::LedState_RedBlink, 3, 200, 200);
-        }
-
-        // LED is automatically off after BlinkLed completes
-        ESP_LOGI(TAG, "Wi-Fi connection result LED complete");
-
         // If no credentials on first boot, enter provisioning mode
         if (!hasCredentials) {
             ESP_LOGI(TAG, "First boot without credentials - entering provisioning mode");
@@ -424,6 +403,7 @@ void ApplicationStateMachine::enterProvisioningMode(ProvisioningMode mode)
             _logiHardwareDriver.get(),
             &_awsIotManager,
             _powerManager.get(),
+            &_timeKeeper,
             &_deviceSettings  // REQ-BLE-01
         );
     }
@@ -449,6 +429,7 @@ bool ApplicationStateMachine::checkAndConnectWifi()
             _logiHardwareDriver.get(),
             &_awsIotManager,
             _powerManager.get(),
+            &_timeKeeper,
             &_deviceSettings  // REQ-BLE-01
         );
     }

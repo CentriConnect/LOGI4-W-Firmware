@@ -13,7 +13,8 @@
 const char* AwsIotManager::TAG = "AwsIotManager";
 
 AwsIotManager::AwsIotManager()
-    : shadow_synced(false) {
+    : shadow_synced(false),
+      delta_received_flag(false) {
     aws_client = std::make_unique<AwsIotClient>();
 }
 
@@ -43,12 +44,6 @@ bool AwsIotManager::Connect()
     if (!aws_client->Connect()) 
     {
         return false;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    if (!SyncDeviceShadow()) {
-        ESP_LOGW(TAG, "Failed to sync device shadow, using defaults");
     }
 
     return true;

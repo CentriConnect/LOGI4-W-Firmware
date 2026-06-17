@@ -5,6 +5,7 @@
 #include "hal/EspNvsStorage.h"
 #include "hal/EspBluetoothManager.h"
 #include "hal/EspPowerManager.h"
+#include "hal/EspTimeKeeper.h"
 #include "ILogiHardwareDriver.h"
 #include "MQTT/AwsIotManager.h"
 #include "logi/DeviceSettings.h"  // REQ-BLE-01: BLE name uses first 4 of DeviceID UUID
@@ -46,6 +47,7 @@ public:
                              ILogiHardwareDriver* driver,
                              AwsIotManager* awsIotManager,
                              EspPowerManager* powerManager,
+                             EspTimeKeeper* timeKeeper,
                              DeviceSettings* deviceSettings);
 
     ~ProvisioningStateMachine();
@@ -94,6 +96,7 @@ private:
     ILogiHardwareDriver* _driver;
     AwsIotManager* _awsIotManager;
     EspPowerManager* _powerManager;
+    EspTimeKeeper* _timeKeeper;
     DeviceSettings* _deviceSettings;        // REQ-BLE-01 (non-const: REQ-FIRSTBOOT-01 applies shadow values)
     ApplicationStateMachine* _parentStateMachine = nullptr;
 
@@ -118,6 +121,8 @@ private:
     void stopProvisioningService();
     esp_err_t getDeviceServiceName(char* serviceName, size_t maxLen);
     esp_err_t getDevicePop(char* pop, size_t maxLen);
+    bool publishFirstBootTelemetry(AwsIotClient* client);
+    void populateFirstBootTelemetryContext(TelemetryContext& context, const LogiSensorData& data) const;
 
     esp_err_t backupCurrentCredentials();
     esp_err_t restoreBackupCredentials();

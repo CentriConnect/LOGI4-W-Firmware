@@ -8,6 +8,9 @@
 static RTC_DATA_ATTR int s_last_battery_mv_filtered = 0;
 static RTC_DATA_ATTR int s_last_solar_mv_filtered = 0;
 static RTC_DATA_ATTR int s_last_batt_temp_mv_filtered = 0; 
+static RTC_DATA_ATTR bool s_last_ambient_valid = false;
+static RTC_DATA_ATTR float s_last_ambient_c = 0.0f;
+static RTC_DATA_ATTR float s_last_humidity_pct = 0.0f;
 
 // Platform-specific includes for logging and delays
 #ifdef ESP_PLATFORM 
@@ -96,6 +99,40 @@ void LogiHardwareDriver::DelayMs(uint32_t milliseconds)
         usleep(milliseconds * 1000);
     }
 #endif
+}
+
+bool LogiHardwareDriver::InitializeLedWithRecovery(const char* context)
+{
+    for (int attempt = 1; attempt <= LED_INIT_MAX_ATTEMPTS; ++attempt)
+    {
+        if (_rgbLed.InitializeDevice())
+        {
+            if (attempt > 1)
+            {
+                LOGI_DRV_LOG_INF("%s: RGB LED initialized after I2C recovery", context);
+            }
+            return true;
+        }
+
+        LOGI_DRV_LOG_ERR("%s: RGB LED initialization failed (attempt %d/%d)",
+                         context, attempt, LED_INIT_MAX_ATTEMPTS);
+
+        if (attempt >= LED_INIT_MAX_ATTEMPTS || _i2cBusRecoveryHook == nullptr)
+        {
+            break;
+        }
+
+        LOGI_DRV_LOG_WRN("%s: attempting I2C bus recovery before retrying RGB LED init", context);
+        if (!_i2cBusRecoveryHook())
+        {
+            LOGI_DRV_LOG_ERR("%s: I2C bus recovery failed", context);
+            break;
+        }
+        DelayMs(20);
+    }
+
+    LOGI_DRV_LOG_ERR("%s: RGB LED is required but did not initialize", context);
+    return false;
 }
 
 // --- Private Helper Methods ---
@@ -214,6 +251,12 @@ void LogiHardwareDriver::UpdateI2cReadingsAndFilters()
 
     if (_tempSensor.Read(temp, hum))
     {
+        if (temp < -40.0f || temp > 85.0f || hum < 0.0f || hum > 100.0f)
+        {
+            LOGI_DRV_LOG_WRN("Ignoring out-of-range SHT4x reading: temp %.2f C, hum %.2f%%", temp, hum);
+            return;
+        }
+
         // INTENTIONAL: Truncate float temp/hum to unsigned short before filtering.
         // Precision loss is acceptable for this application's filtering needs.
         unsigned short temp_truncated = static_cast<unsigned short>(temp);
@@ -221,6 +264,9 @@ void LogiHardwareDriver::UpdateI2cReadingsAndFilters()
 
         _tempSensorTempMovingAverageFilter.addSample(temp_truncated);
         _tempSensorHumidityMovingAverageFilter.addSample(hum_truncated);
+        s_last_ambient_valid = true;
+        s_last_ambient_c = temp;
+        s_last_humidity_pct = hum;
 
         LOGI_DRV_LOG_DBG("I2C Update: Temp %.2f (Truncated: %u), Hum %.2f (Truncated: %u)",
                          temp, temp_truncated, hum, hum_truncated);
@@ -256,14 +302,10 @@ bool LogiHardwareDriver::Initialize()
         LOGI_DRV_LOG_ERR("One or more direct ADCs not initialized!");
         success = false;
     }
-    // v1.2.1: LED failure is NON-FATAL. On boards where the I2C bus clamps
-    // (ISS-FW-012 PCA9512AD/U2 population variance), the LED is a casualty -
-    // but the device must still provision and post. Halting the whole app on
-    // a dead status LED turned Nick's boards (and one bench boot) into bricks.
-    const bool ledOk = _rgbLed.InitializeDevice();
+    bool ledOk = InitializeLedWithRecovery("Initialize");
     if (!ledOk)
     {
-        LOGI_DRV_LOG_ERR("RGB LED initialization failed - continuing WITHOUT LED (non-fatal).");
+        success = false;
     }
 
     if (success)
@@ -276,13 +318,11 @@ bool LogiHardwareDriver::Initialize()
             DisableLed();
         }
 
-        // REQ-I2C-01: raise SPS HIGH exactly once, AFTER the bus is up and the
-        // last LED init write has landed, and keep it HIGH for the session
-        // (b14dad7, re-proven clean on bench 2026-06-12). Raising it before
-        // bus creation clamps some boards; toggling it per-read broke the bus
-        // mid-op historically. This is the only SPS edge of the session.
-        _sensorPowerGpio.Write(true);
-        LOGI_DRV_LOG_INF("SPS (sensor power) raised after LED init - held HIGH for session.");
+        // Keep SPS low during startup/provisioning. On this rev-4.1 bench unit,
+        // raising SPS here makes the LED's I2C device unreachable even after a
+        // full bus rebuild. Measurement paths enable SPS only while sampling.
+        _sensorPowerGpio.Write(false);
+        LOGI_DRV_LOG_INF("SPS (sensor power) held LOW after init; measurement paths enable it on demand.");
     }
 
     LOGI_DRV_LOG_INF("Logi Hardware Driver Initialization complete (Success: %d, LED: %d).", success, ledOk);
@@ -292,7 +332,12 @@ bool LogiHardwareDriver::Initialize()
 bool LogiHardwareDriver::SaturateFilters()
 {
     LOGI_DRV_LOG_INF("Saturating filters (Capacity: %d)...", MovingAverage::CAPACITY);
-    // SPS already HIGH since factory init (v1.2.1) - never toggled mid-session.
+    _sensorPowerGpio.Write(true);
+    if (_i2cBusRecoveryHook != nullptr)
+    {
+        _i2cBusRecoveryHook();
+    }
+    DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
     LOGI_DRV_LOG_INF("Enabling GNSS power (GPIO HIGH)...");
@@ -319,6 +364,7 @@ bool LogiHardwareDriver::SaturateFilters()
     {
        LOGI_DRV_LOG_INF("Filters already saturated.");
        _measureGpio.Write(false);
+       _sensorPowerGpio.Write(false);
        // REQ-I2C-01 / SPS: do NOT toggle SPS LOW — keeping it HIGH continuously
        // is required for reliable SHT4x I2C reads (LOW->HIGH transition mid-op
        // breaks the bus). See hardware_test.cpp:94 reference pattern.
@@ -338,6 +384,7 @@ bool LogiHardwareDriver::SaturateFilters()
         {
             LOGI_DRV_LOG_INF("Filter saturation loop timed out!");
             _measureGpio.Write(false);
+            _sensorPowerGpio.Write(false);
             // REQ-I2C-01 / SPS: keep SPS HIGH (see above)
             _gnssEnableGpio.Write(false);
             return false;
@@ -346,6 +393,7 @@ bool LogiHardwareDriver::SaturateFilters()
     LOGI_DRV_LOG_INF("Saturation loop finished after %d samples.", samples_taken);
 
     _measureGpio.Write(false);
+    _sensorPowerGpio.Write(false);
     // REQ-I2C-01 / SPS: keep SPS HIGH (see above)
     // Note: Keep GNSS enabled - it will be disabled after GPS data is read in GetLatestSensorData
 
@@ -363,7 +411,12 @@ bool LogiHardwareDriver::SaturateFilters()
 void LogiHardwareDriver::UpdateMeasurements()
 {
     LOGI_DRV_LOG_DBG("Updating measurements...");
-    // SPS already HIGH since factory init (v1.2.1) - never toggled mid-session.
+    _sensorPowerGpio.Write(true);
+    if (_i2cBusRecoveryHook != nullptr)
+    {
+        _i2cBusRecoveryHook();
+    }
+    DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
     _gnssEnableGpio.Write(true);  // Enable GNSS power for GPS acquisition
@@ -376,6 +429,7 @@ void LogiHardwareDriver::UpdateMeasurements()
     UpdateAdcReadingsAndFilters();
 
     _measureGpio.Write(false);
+    _sensorPowerGpio.Write(false);
     // REQ-I2C-01 / SPS: keep SPS HIGH (see SaturateFilters comment)
     // Note: Keep GNSS enabled - it will be disabled after GPS data is read
     LOGI_DRV_LOG_DBG("Measurements updated.");
@@ -450,12 +504,27 @@ void LogiHardwareDriver::GetLatestSensorData(LogiSensorData &sensorData)
 
     // --- Environment ---
     // Retrieve filtered (truncated) counts and cast back to float
-    unsigned short filt_temp_u16, filt_hum_u16;
-    _tempSensorTempMovingAverageFilter.getOutput(filt_temp_u16);
-    _tempSensorHumidityMovingAverageFilter.getOutput(filt_hum_u16);
-    // WARNING: Casting back to float does not recover lost precision.
-    sensorData.MeasuredTemperatureC = static_cast<float>(filt_temp_u16);
-    sensorData.MeasuredHumidityPercentage = static_cast<float>(filt_hum_u16);
+    unsigned short filt_temp_u16 = 0;
+    unsigned short filt_hum_u16 = 0;
+    bool tempOk = _tempSensorTempMovingAverageFilter.getOutput(filt_temp_u16);
+    bool humOk = _tempSensorHumidityMovingAverageFilter.getOutput(filt_hum_u16);
+    if (tempOk && humOk)
+    {
+        // WARNING: Casting back to float does not recover lost precision.
+        sensorData.MeasuredTemperatureC = static_cast<float>(filt_temp_u16);
+        sensorData.MeasuredHumidityPercentage = static_cast<float>(filt_hum_u16);
+    }
+    else if (s_last_ambient_valid)
+    {
+        sensorData.MeasuredTemperatureC = s_last_ambient_c;
+        sensorData.MeasuredHumidityPercentage = s_last_humidity_pct;
+    }
+    else
+    {
+        LOGI_DRV_LOG_WRN("No valid ambient sample available; reporting ambient as 0");
+        sensorData.MeasuredTemperatureC = 0.0f;
+        sensorData.MeasuredHumidityPercentage = 0.0f;
+    }
 
     _gps_sensor.GetGpsData(sensorData.GPSData);
 
@@ -467,9 +536,8 @@ void LogiHardwareDriver::GetLatestSensorData(LogiSensorData &sensorData)
 void LogiHardwareDriver::SetupLed()
 {
     LOGI_DRV_LOG_DBG("Setting up LED...");
-    if (!_rgbLed.InitializeDevice())
+    if (!InitializeLedWithRecovery("SetupLed"))
     {
-        LOGI_DRV_LOG_ERR("Failed to initialize RGB LED in SetupLed");
         return;
     }
     if (!_rgbLed.SetGlobalCurrent(LED_OUTPUT_CURRENT_REG_VALUE))
@@ -549,8 +617,15 @@ void LogiHardwareDriver::SetLedState(LedState state)
     else
     {
         _rgbLed.SetLedStandby(false);
-        _rgbLed.InitializeDevice();
-        _rgbLed.SetBreathingMode(false);
+        if (!InitializeLedWithRecovery("SetLedState"))
+        {
+            return;
+        }
+        if (!_rgbLed.SetBreathingMode(false))
+        {
+            LOGI_DRV_LOG_ERR("SetLedState: failed to disable LED breathing mode");
+            return;
+        }
     }
 
     _ledTaskR = r;
@@ -660,7 +735,10 @@ void LogiHardwareDriver::LedTaskLoop()
                     if (_i2cBusRecoveryHook())
                     {
                         consecutiveFailures = 0;
-                        _rgbLed.InitializeDevice(); // re-init LED registers on the fresh bus
+                        if (!InitializeLedWithRecovery("led_blink"))
+                        {
+                            i2cLatched = true;
+                        }
                         continue;
                     }
                 }
@@ -683,29 +761,42 @@ void LogiHardwareDriver::BlinkLed(LedState state, int count, int onMs, int offMs
 
     // Ensure LED is initialized and breathing mode is off
     _rgbLed.SetLedStandby(false);
-    _rgbLed.InitializeDevice();
-    _rgbLed.SetBreathingMode(false);
+    if (!InitializeLedWithRecovery("BlinkLed"))
+    {
+        return;
+    }
+    if (!_rgbLed.SetBreathingMode(false))
+    {
+        LOGI_DRV_LOG_ERR("BlinkLed: failed to disable LED breathing mode");
+        return;
+    }
 
     // Set color based on state
+    bool colorOk = true;
     switch (state)
     {
         case LedState::LedState_GreenBlink:
-            _rgbLed.SetRGB(0, LED_BRIGHTNESS_GREEN, 0);
+            colorOk = _rgbLed.SetRGB(0, LED_BRIGHTNESS_GREEN, 0);
             break;
         case LedState::LedState_YellowBlink:
-            _rgbLed.SetRGB(LED_BRIGHTNESS_YELLOW_RED, LED_BRIGHTNESS_YELLOW_GREEN, 0);
+            colorOk = _rgbLed.SetRGB(LED_BRIGHTNESS_YELLOW_RED, LED_BRIGHTNESS_YELLOW_GREEN, 0);
             break;
         case LedState::LedState_BlueBlink:
-            _rgbLed.SetRGB(0, 0, LED_BRIGHTNESS_BLUE);
+            colorOk = _rgbLed.SetRGB(0, 0, LED_BRIGHTNESS_BLUE);
             break;
         case LedState::LedState_RedBlink:
         case LedState::LedState_RedFastBlink:
         case LedState::LedState_RedSolid:
-            _rgbLed.SetRGB(LED_BRIGHTNESS_RED, 0, 0);
+            colorOk = _rgbLed.SetRGB(LED_BRIGHTNESS_RED, 0, 0);
             break;
         default:
             LOGI_DRV_LOG_WRN("BlinkLed: unsupported state %d", static_cast<int>(state));
             return;
+    }
+    if (!colorOk)
+    {
+        LOGI_DRV_LOG_ERR("BlinkLed: failed to set LED color - skipping blink request");
+        return;
     }
 
     // Simple blocking blink loop
