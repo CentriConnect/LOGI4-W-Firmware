@@ -38,7 +38,7 @@ const gpio_num_t EspLogiHardwareFactory::UART_TX_PIN = GPIO_NUM_5;  // Per schem
 // case where 400 kHz on internal pull-ups was marginal. Drop to 100 kHz removes
 // the marginal-edge-timing failure mode. (PDEC-001 still open re: external
 // pull-ups; if present, we could revisit 400 kHz later.)
-const uint32_t EspLogiHardwareFactory::I2C_FREQ_HZ = 100000;
+const uint32_t EspLogiHardwareFactory::I2C_FREQ_HZ = 100000;  // 100k reliable now that the ADS1015 is read with SPS LOW + OS-poll/retry (V13-010). HW note: R7/R8 (10k I2C pullups) are DNP -- only weak R6 100k on +3.3S; populate them for margin.
 const uint16_t EspLogiHardwareFactory::SHT4X_I2C_ADDR = 0x44;
 const uint16_t EspLogiHardwareFactory::RGBLED_I2C_ADDR = 0x68;
 const gpio_num_t EspLogiHardwareFactory::POWER_ERROR_GPIO = GPIO_NUM_18;

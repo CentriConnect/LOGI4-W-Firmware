@@ -34,6 +34,11 @@ static const char *TAG_ANALOG_LS = "AnalogLSensor";
     printf("\n")
 #endif
 
+// +3.3S supply rail is regulated; with the SPS-LOW design it can't be read back
+// over I2C while SPS is pulsed high (the ADS1015 bus clamps), so the ratiometric
+// fuel calc uses this nominal instead of an unreliable live read.
+static constexpr int NOMINAL_SUPPLY_MV = 3300;
+
 // --- Constructor ---
 AnalogLevelSensor::AnalogLevelSensor(IAdcHal &fuel_adc_hal_ref, IAdcHal &supply_adc_hal_ref)
     : fuelAdc(fuel_adc_hal_ref),
@@ -50,8 +55,8 @@ AnalogLevelSensor::AnalogLevelSensor(IAdcHal &fuel_adc_hal_ref, IAdcHal &supply_
         ANALOG_LS_LOG_ERR("Supply ADC HAL provided is not initialized!");
     }
 
-    // Consider initialized only if BOTH underlying HALs are ready
-    _initialized = fuelAdc.IsInitialized() && supplyAdc.IsInitialized();
+    // SPS-LOW design uses a nominal supply, so only the fuel ADC must be ready.
+    _initialized = fuelAdc.IsInitialized();
 
     if (_initialized)
     {
@@ -94,9 +99,9 @@ bool AnalogLevelSensor::Read(int &level_percent, int &fuel_mv, int &supply_mv)
     fuel_mv = 0;
     supply_mv = 0;
     HalAdcError fuel_err;
-    HalAdcError supply_err;
 
-    // Read fuel sensor voltage
+    // Read fuel sensor voltage (internal ADC; caller has pulsed SPS HIGH so the
+    // head is powered). No I2C here -> unaffected by the SPS-high bus clamp.
     fuel_err = fuelAdc.GetMillivolts(&fuel_mv);
     if (fuel_err != HAL_ADC_OK)
     {
@@ -107,24 +112,9 @@ bool AnalogLevelSensor::Read(int &level_percent, int &fuel_mv, int &supply_mv)
         return false;
     }
 
-    // Read supply voltage
-    supply_err = supplyAdc.GetMillivolts(&supply_mv);
-    if (supply_err != HAL_ADC_OK)
-    {
-        ANALOG_LS_LOG_ERR("Failed to read supply ADC (Error: %d)", supply_err);
-        level_percent = 0;
-        fuel_mv = 0;
-        supply_mv = 0;
-        return false;
-    }
-
-    // Basic check for valid supply voltage to avoid division by zero or nonsensical results
-    if (supply_mv <= 0)
-    {
-        ANALOG_LS_LOG_ERR("Invalid supply voltage reading (%d mV). Cannot calculate level.", supply_mv);
-        level_percent = 0;
-        return false;
-    }
+    // SPS-LOW design: +3.3S can't be read over I2C while SPS is high (ADS1015
+    // bus clamps), so use the regulated nominal for the ratiometric calc.
+    supply_mv = NOMINAL_SUPPLY_MV;
 
     // Calculate ratiometric level percentage
     // Ensure intermediate calculation uses floating-point

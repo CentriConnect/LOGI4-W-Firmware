@@ -216,13 +216,19 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
         LOGI_DRV_LOG_ERR("Failed to read Battery Temp ADC counts: %d", adcErr);
     }
 
-    // Update Analog Level Sensor (also get the actual voltage readings)
+    // Fuel: the head needs the +3.3S rail, so pulse SPS HIGH only for THIS read.
+    // bat/sol/temp above were read with SPS LOW (reliable I2C). The fuel read is
+    // the internal ADC (no I2C), so the SPS-high bus clamp doesn't matter; supply
+    // is the regulated nominal (can't be read over I2C with SPS high).
+    _sensorPowerGpio.Write(true);
+    DelayMs(50);  // settle the +3.3S rail + fuel head
     if (!_analogLevelSensor.Read(_last_fuel_level_percent, _last_fuel_mv, _last_fuel_supply_mv))
     {
         LOGI_DRV_LOG_ERR("Failed to read Analog Level Sensor");
         _last_fuel_mv = 0;
         _last_fuel_supply_mv = 0;
     }
+    _sensorPowerGpio.Write(false);
 
     // Update last known filtered mV values AFTER updating filters
     // Use fresh reading if valid, otherwise fall back to RTC-persisted value
@@ -332,13 +338,9 @@ bool LogiHardwareDriver::Initialize()
 bool LogiHardwareDriver::SaturateFilters()
 {
     LOGI_DRV_LOG_INF("Saturating filters (Capacity: %d)...", MovingAverage::CAPACITY);
-    _sensorPowerGpio.Write(true);
-    // V13-010 root cause: do NOT rebuild the I2C bus every cycle. The recovery
-    // hook (RecoverI2cBus) is last-resort recovery for a *wedged* bus; running it
-    // per measurement tore down + re-added the ADS1015 mid-read, so the 2nd+
-    // back-to-back read returned bad supply -> fuel/raw/supv zeroed together (the
-    // ratiometric fuel calc needs supply). The factory builds the bus cleanly;
-    // recover only on an actual wedge, not on the happy path.
+    // SPS stays LOW for the I2C/ADS1015 reads (SPS-high clamps the bus); the fuel
+    // read pulses SPS high itself (UpdateAdcReadingsAndFilters). No per-cycle I2C
+    // teardown either (it broke back-to-back reads).
     DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
@@ -413,9 +415,9 @@ bool LogiHardwareDriver::SaturateFilters()
 void LogiHardwareDriver::UpdateMeasurements()
 {
     LOGI_DRV_LOG_DBG("Updating measurements...");
-    _sensorPowerGpio.Write(true);
-    // V13-010 root cause: no per-measurement I2C bus teardown (see SaturateFilters).
-    // Tearing down/re-adding the ADS1015 each call broke back-to-back reads.
+    // SPS stays LOW for the I2C/ADS1015 reads (SPS-high clamps the bus -> bad
+    // bat/sol/supply). UpdateAdcReadingsAndFilters pulses SPS high only for the
+    // fuel internal-ADC read. No per-cycle I2C teardown either (it broke back-to-back).
     DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
