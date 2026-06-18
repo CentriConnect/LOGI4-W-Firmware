@@ -562,7 +562,7 @@ void PostingStateMachine::PostingStateDoFOTAUpdate()
 
 void PostingStateMachine::PostingStateAcquireFinalSample()
 {
-    ESP_LOGI(TAG, "Activation [4/5]: acquiring final sensor/GPS sample before repost");
+    ESP_LOGI(TAG, "Activation [4/5]: acquiring GPS for final post (reusing DataSample sensors)");
 
     ILogiHardwareDriver* driver = _parentStateMachine ? _parentStateMachine->GetHardwareDriver() : nullptr;
     if (driver == nullptr)
@@ -572,7 +572,12 @@ void PostingStateMachine::PostingStateAcquireFinalSample()
         return;
     }
 
-    driver->UpdateMeasurements();
+    // V13-010: do NOT re-measure here. A 2nd back-to-back UpdateMeasurements gives
+    // bad ADS1015 reads (wrong bat/sol/supv -> wrong fuel). Reuse the DataSample
+    // sensors already in _sensorData and only acquire GPS (mirrors the activation
+    // measure-once approach). Re-enable GNSS (DataSample's GetLatestSensorData
+    // powered it off) so it can get a fix during the wait below.
+    driver->SetGnssPower(true);
 
     constexpr uint32_t GPS_WAIT_MS = 120000;
     constexpr uint32_t GPS_POLL_MS = 1000;
@@ -591,7 +596,8 @@ void PostingStateMachine::PostingStateAcquireFinalSample()
         }
     }
 
-    driver->GetLatestSensorData(_sensorData);
+    driver->GetGpsData(_sensorData.GPSData);   // merge ONLY GPS into the reused DataSample snapshot
+    driver->SetGnssPower(false);
     _sensorData.elapsedTimeStampS = static_cast<uint32_t>(_timeKeeper->GetCurrentTime());
 
     if (_sensorData.GPSData.valid)
