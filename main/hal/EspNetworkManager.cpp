@@ -62,6 +62,20 @@ bool EspNetworkManager::Initialize()
         return false;
     }
 
+    // Report a friendly DHCP hostname to the router instead of the ESP-IDF
+    // default "espressif" (per Nick). Set on the STA netif now, before Wi-Fi
+    // start/DHCP, so it is sent in the DHCP request on connect.
+    const char *kStaHostname = "Centri MyPropane";  // name shown on the router (space is non-standard; verify it renders)
+    err = esp_netif_set_hostname(m_sta_netif, kStaHostname);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_netif_set_hostname failed: %s (using default)", esp_err_to_name(err));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "STA DHCP hostname set to '%s'", kStaHostname);
+    }
+
     // 4. Initialize Wi-Fi Driver
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
