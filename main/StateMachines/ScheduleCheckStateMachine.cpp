@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "wifiCredentials.h"
+#include "logi/Faults.h"
 
 static const char *TAG = "ScheduleCheckStateMachine";
 
@@ -87,6 +88,9 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCheckProvisioning()
         //     _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
         //     return;
         // }
+
+        // LOWBAT is flagged once per measurement in LogiHardwareDriver::GetLatestSensorData
+        // so it rides every post (incl. activation); no per-schedule check needed here.
 
         time_t current_time = _timeKeeper->GetCurrentTime();
         update_last_post_time(static_cast<int64_t>(current_time));
@@ -222,6 +226,9 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
         //     _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
         //     return;
         // }
+
+        // LOWBAT is flagged once per measurement in LogiHardwareDriver::GetLatestSensorData
+        // so it rides every post (incl. activation); no per-schedule check needed here.
 
         // DO PERFORM POST
         ESP_LOGI(TAG, "Both conditions met: Can post now (no post in last 5 min AND within scheduled window)");

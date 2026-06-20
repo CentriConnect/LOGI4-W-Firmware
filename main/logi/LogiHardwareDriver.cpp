@@ -1,4 +1,6 @@
 #include "logi/LogiHardwareDriver.h"
+#include "logi/Faults.h"
+#include "sdkconfig.h"
 #include <math.h>
 #include <cstring>
 #include <limits.h>
@@ -184,6 +186,7 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
     else
     {
         LOGI_DRV_LOG_ERR("Failed to read Battery ADC counts: %d", adcErr);
+        Faults_Set(FAULT_ADC);
     }
 
     // Read solar voltage counts
@@ -199,6 +202,7 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
     else
     {
         LOGI_DRV_LOG_ERR("Failed to read Solar ADC counts: %d", adcErr);
+        Faults_Set(FAULT_ADC);
     }
 
     // Read battery temp voltage counts
@@ -214,6 +218,7 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
     else
     {
         LOGI_DRV_LOG_ERR("Failed to read Battery Temp ADC counts: %d", adcErr);
+        Faults_Set(FAULT_ADC);
     }
 
     // Fuel: the head needs the +3.3S rail, so pulse SPS HIGH only for THIS read.
@@ -225,6 +230,7 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
     if (!_analogLevelSensor.Read(_last_fuel_level_percent, _last_fuel_mv, _last_fuel_supply_mv))
     {
         LOGI_DRV_LOG_ERR("Failed to read Analog Level Sensor");
+        Faults_Set(FAULT_FUEL);
         _last_fuel_mv = 0;
         _last_fuel_supply_mv = 0;
     }
@@ -280,6 +286,7 @@ void LogiHardwareDriver::UpdateI2cReadingsAndFilters()
     else
     {
         LOGI_DRV_LOG_ERR("Failed to read Temperature Sensor (SHT4x)");
+        Faults_Set(FAULT_AMB);
         // Do not add samples if read failed
     }
 }
@@ -532,6 +539,20 @@ void LogiHardwareDriver::GetLatestSensorData(LogiSensorData &sensorData)
 
     // Disable GNSS power after reading GPS data to save power
     _gnssEnableGpio.Write(false);
+
+    // Latch power-fault + low-battery into the per-post fault accumulator while the
+    // snapshot is assembled. This runs every measurement cycle, so the faults ride
+    // every post (including activation). CHG (IO23) is a charging-status line, not
+    // an error, so it is intentionally NOT mapped to a fault.
+    if (IsPowerErrorActive())
+    {
+        Faults_Set(FAULT_PWR);
+    }
+    const float lowbat_threshold_v = static_cast<float>(CONFIG_LOGI_BATTERY_VOLTAGE_POST_THRESHOLD_10X) / 10.0f;
+    if (sensorData.AnalogBatteryVoltage > 0.0f && sensorData.AnalogBatteryVoltage < lowbat_threshold_v)
+    {
+        Faults_Set(FAULT_LOWBAT);
+    }
 }
 
 void LogiHardwareDriver::SetGnssPower(bool on)
@@ -836,7 +857,9 @@ bool LogiHardwareDriver::IsChargingErrorActive()
 }
 bool LogiHardwareDriver::IsPowerErrorActive()
 {
-    return _powerErrorGpio.Read() == 1;
+    // Active-low fault: the power-error input idles HIGH (normal) and is pulled LOW
+    // on a fault (PCBA checkout confirms pin level 1 == NORMAL).
+    return _powerErrorGpio.Read() == 0;
 }
 
 bool LogiHardwareDriver::GetGpsData(GpsData_t& gpsData)

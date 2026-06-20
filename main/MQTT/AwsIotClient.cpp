@@ -481,6 +481,9 @@ std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& d
     snprintf(gpsQuality, sizeof(gpsQuality), "%d,0", data.GPSData.rssi);
     cJSON_AddStringToObject(root, "gsq", gpsQuality);
     cJSON_AddStringToObject(root, "err", ctx.errorLogValid ? ctx.errorLog : "");
+    if (ctx.deviceStatusValid) {
+        cJSON_AddNumberToObject(root, "deviceStatus", ctx.deviceStatus);
+    }
     cJSON_AddNumberToObject(root, "raw", roundToTwoDecimals(data.AnalogFuelVoltage));
     cJSON_AddNumberToObject(root, "supv", roundToTwoDecimals(data.SensorSupplyVoltage));
 

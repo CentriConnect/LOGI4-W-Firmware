@@ -1,6 +1,7 @@
 #include "EspNetworkManager.h"
 #include "esp_log.h"
-#include "string.h" 
+#include "string.h"
+#include "logi/Faults.h"
 
 #include "freertos/task.h" 
 
@@ -260,6 +261,7 @@ bool EspNetworkManager::Connect(const char *ssid, const char *password)
     else if (bits & WIFI_FAIL_BIT)
     {
         ESP_LOGE(TAG, "Connection failed (Disconnected or max retries reached).");
+        Faults_Set(FAULT_WIFI);
         // m_lastFailureType is already set by EventHandler based on disconnect reason
         // Don't necessarily need to call disconnect, as wifi driver might be stopped by event handler
         // Or maybe stop it explicitly to be sure? Let's stop it.
@@ -274,6 +276,7 @@ bool EspNetworkManager::Connect(const char *ssid, const char *password)
     else
     {
         ESP_LOGE(TAG, "Connection attempt timed out.");
+        Faults_Set(FAULT_WIFI);
         m_lastFailureType = WifiFailureType::WifiFailure_Timeout;  // Mark as timeout
         if (m_wifi_started)
         {

@@ -9,6 +9,7 @@
 #include <ctime>
 #include <cstring>
 #include "logi/ResetCounter.h"
+#include "logi/Faults.h"
 
 ESP_EVENT_DECLARE_BASE(LOGI_PROV_TIMEOUT_EVENT);
 ESP_EVENT_DEFINE_BASE(LOGI_PROV_TIMEOUT_EVENT);
@@ -261,6 +262,7 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
         ESP_LOGI(TAG, "Synchronizing UTC time before AWS IoT TLS/MQTT connect...");
         if (!_timeKeeper->SyncTime()) {
             ESP_LOGE(TAG, "NTP sync failed before AWS IoT connect - staying in provisioning");
+            Faults_Set(FAULT_NTP);
             transitionTo(ProvisioningState::ProvisioningState_Failed);
             return;
         }
@@ -733,8 +735,11 @@ void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContex
     ctx.chargerStatusValid = true;
     ctx.resetCounter = LogiResetCounter_Get();
     ctx.resetCounterValid = true;
-    ctx.errorLog[0] = '\0';
+    uint32_t fault_status = 0;
+    Faults_Render(ctx.errorLog, sizeof(ctx.errorLog), &fault_status);
+    ctx.deviceStatus = (int32_t)fault_status;
     ctx.errorLogValid = true;
+    ctx.deviceStatusValid = true;
 }
 
 // ============================================================================

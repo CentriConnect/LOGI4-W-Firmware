@@ -24,6 +24,7 @@ set(SOURCES
     "logi/EspLogiHardwareFactory.cpp"
     "logi/DeviceSettings.cpp"
     "logi/ResetCounter.cpp"
+    "logi/Faults.cpp"
     "helpers/MovingAverage.cpp"
     "CLibFiles/DateTime/Date.c"
     "CLibFiles/DateTime/Time.c"

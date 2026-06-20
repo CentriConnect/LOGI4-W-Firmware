@@ -10,6 +10,7 @@
 #include "esp_wifi.h"
 #include "hal/EspNvsStorage.h"
 #include "logi/ResetCounter.h"
+#include "logi/Faults.h"
 
 static const char *TAG = "PostingStateMachine";
 
@@ -151,7 +152,12 @@ bool PostingStateMachine::publishTelemetrySnapshot(const LogiSensorData& data, c
     populateTelemetryContext(telemetryContext);
 
     ESP_LOGI(TAG, "Publishing %s telemetry snapshot (LOGI4 format)", label ? label : "activation");
-    return _awsIotManager->PostTelemetryLogi4Format(data, telemetryContext);
+    bool published = _awsIotManager->PostTelemetryLogi4Format(data, telemetryContext);
+    if (!published)
+    {
+        Faults_Set(FAULT_AWS);
+    }
+    return published;
 }
 
 void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& shadowState)
@@ -230,6 +236,7 @@ void PostingStateMachine::PostingStateTryConnect()
         else
         {
             ESP_LOGE(TAG, "NTP sync failed before AWS IoT connect.");
+            Faults_Set(FAULT_NTP);
             _connectRetryCount++;
 
             if (_connectRetryCount >= MAX_CONNECT_RETRIES)
@@ -260,6 +267,7 @@ void PostingStateMachine::PostingStateTryConnect()
     else
     {
         ESP_LOGE(TAG, "Connection failed.");
+        Faults_Set(FAULT_AWS);
         _connectRetryCount++;
 
         // Check if we've exceeded max retries
@@ -318,6 +326,7 @@ void PostingStateMachine::PostingStateSubscribeToTopics()
         else
         {
             ESP_LOGW(TAG, "NTP sync failed, continuing with cached/invalid time");
+            Faults_Set(FAULT_NTP);
         }
     }
 
@@ -611,6 +620,7 @@ void PostingStateMachine::PostingStateAcquireFinalSample()
     else
     {
         ESP_LOGW(TAG, "GPS fix not acquired before timeout; final telemetry will report GPS defaults");
+        Faults_Set(FAULT_GPS);
     }
 
     transitionTo(PostingState::PostingState_PostFinalTelemetry);
@@ -623,6 +633,9 @@ void PostingStateMachine::PostingStatePostFinalTelemetry()
     if (publishTelemetrySnapshot(_sensorData, "final"))
     {
         _postSuccessful = true;
+        // Final post landed: this cycle's faults have been reported, so reset the
+        // accumulator. The next cycle starts clean. (Only after the FINAL post.)
+        Faults_Clear();
         while (_parentStateMachine && !_parentStateMachine->isPostQueueEmpty())
         {
             _parentStateMachine->removeFirstFromPostQueue();
@@ -823,13 +836,12 @@ void PostingStateMachine::populateTelemetryContext(TelemetryContext& ctx) const
     ctx.bleStatus = 0;
     ctx.bleStatusValid = true;
 
-    // === Device Status (0 = normal operation) ===
-    ctx.deviceStatus = 0;
+    // === Device Status + Error Log (rendered from the per-post fault accumulator) ===
+    uint32_t fault_status = 0;
+    Faults_Render(ctx.errorLog, sizeof(ctx.errorLog), &fault_status);
+    ctx.deviceStatus = (int32_t)fault_status;
+    ctx.errorLogValid = true;
     ctx.deviceStatusValid = true;
-
-    // === Error Log (empty for now) ===
-    ctx.errorLog[0] = '\0';
-    ctx.errorLogValid = false;
 
     // === Reset Counter ===
     ctx.resetCounter = LogiResetCounter_Get();
