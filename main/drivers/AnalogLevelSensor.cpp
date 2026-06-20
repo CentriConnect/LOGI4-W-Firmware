@@ -112,9 +112,14 @@ bool AnalogLevelSensor::Read(int &level_percent, int &fuel_mv, int &supply_mv)
         return false;
     }
 
-    // SPS-LOW design: +3.3S can't be read over I2C while SPS is high (ADS1015
-    // bus clamps), so use the regulated nominal for the ratiometric calc.
-    supply_mv = NOMINAL_SUPPLY_MV;
+    // R7/R8 populated: the ADS1015 supply (AIN1) reads reliably even with SPS
+    // high, so read it live; fall back to the regulated nominal on any failure.
+    HalAdcError supply_err = supplyAdc.GetMillivolts(&supply_mv);
+    if (supply_err != HAL_ADC_OK || supply_mv <= 0)
+    {
+        ANALOG_LS_LOG_WRN("Supply read failed (e%d, %d mV) -> nominal %d", (int)supply_err, supply_mv, NOMINAL_SUPPLY_MV);
+        supply_mv = NOMINAL_SUPPLY_MV;
+    }
 
     // Calculate ratiometric level percentage
     // Ensure intermediate calculation uses floating-point
