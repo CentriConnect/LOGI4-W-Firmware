@@ -350,16 +350,19 @@ bool ApplicationStateMachine::isPostQueueEmpty() const
     return _postQueueCount == 0;
 }
 
-bool ApplicationStateMachine::addToPostQueue(const LogiSensorData& data)
+bool ApplicationStateMachine::addToPostQueue(const LogiSensorData& data, PostTransport transport)
 {
     if (_postQueueCount >= POST_QUEUE_SIZE) {
         ESP_LOGE(TAG, "Post queue is full. Cannot add new data.");
         return false;
     }
     _postQueue[_postQueueTail] = data;
+    _postQueueTransport[_postQueueTail] = transport;
     _postQueueTail = (_postQueueTail + 1) % POST_QUEUE_SIZE;
     _postQueueCount++;
-    ESP_LOGI(TAG, "Added sensor data to post queue. Count: %d", _postQueueCount);
+    ESP_LOGI(TAG, "Added sensor data to post queue (%s). Count: %d",
+             transport == PostTransport::PostTransport_Udp ? "UDP" : "MQTT",
+             _postQueueCount);
     return true;
 }
 
@@ -367,6 +370,12 @@ const LogiSensorData& ApplicationStateMachine::peekPostQueue() const
 {
     // This should only be called after checking isPostQueueEmpty()
     return _postQueue[_postQueueHead];
+}
+
+PostTransport ApplicationStateMachine::peekPostQueueTransport() const
+{
+    // This should only be called after checking isPostQueueEmpty()
+    return _postQueueTransport[_postQueueHead];
 }
 
 void ApplicationStateMachine::removeFirstFromPostQueue()

@@ -35,6 +35,7 @@ set(SOURCES
     "MQTT/AwsIotConfig.cpp"
     "MQTT/AwsIotJobsHandler.cpp"
     "MQTT/ShadowParser.cpp"
+    "UDP/UdpTelemetryClient.cpp"
     "StateMachines/ApplicationStateMachine.cpp"
     "StateMachines/CheckFillDetectStateMachine.cpp"
     "StateMachines/DataSampleStateMachine.cpp"
@@ -54,6 +55,7 @@ set(INCLUDE_DIRS
     "helpers"
     "CLibFiles"
     "MQTT"
+    "UDP"
     "StateMachines"
 )
 

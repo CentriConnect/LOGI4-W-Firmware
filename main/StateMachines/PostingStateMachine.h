@@ -59,7 +59,9 @@ private:
     // Populates TelemetryContext with device info, settings, etc. for LOGI4 format
     void populateTelemetryContext(TelemetryContext& context) const;
     bool publishTelemetrySnapshot(const LogiSensorData& data, const char* label);
+    bool publishUdpTelemetrySnapshot(const LogiSensorData& data, const char* label);
     void applyShadowSettingsToMemory(const DeviceShadowState& shadowState);
+    DeviceShadowState buildReportedShadowFromSettings(const DeviceShadowState& parsedShadowState) const;
 
     // State handler methods
     void PostingStateInitialEnter();

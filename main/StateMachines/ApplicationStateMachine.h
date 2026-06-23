@@ -50,9 +50,10 @@ public:
 
     bool isPostQueueEmpty() const;
 
-    bool addToPostQueue(const LogiSensorData& data);
+    bool addToPostQueue(const LogiSensorData& data, PostTransport transport = PostTransport::PostTransport_Mqtt);
 
     const LogiSensorData& peekPostQueue() const;
+    PostTransport peekPostQueueTransport() const;
 
     void removeFirstFromPostQueue();
 
@@ -94,6 +95,7 @@ private:
     bool _sensorDataValid = false;
 
     LogiSensorData _postQueue[POST_QUEUE_SIZE];
+    PostTransport _postQueueTransport[POST_QUEUE_SIZE];
 
     int _postQueueHead = 0;
     int _postQueueTail = 0;

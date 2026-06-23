@@ -169,6 +169,32 @@ menu "Featured FreeRTOS IoT Integration"
                 int "Configures the max length of the broker host name."
                 default 100
 
+            config LOGI_UDP_POST_ENABLED
+                bool "Enable compact UDP telemetry posts"
+                default y
+                help
+                    Sends each LOGI telemetry snapshot as one compact JSON UDP
+                    datagram with an HMAC-SHA256 sig field.
+
+            config LOGI_UDP_POST_HOST
+                string "Compact UDP telemetry host"
+                depends on LOGI_UDP_POST_ENABLED
+                default "udp.centriconnect.com"
+
+            config LOGI_UDP_POST_PORT
+                int "Compact UDP telemetry port"
+                depends on LOGI_UDP_POST_ENABLED
+                default 0
+
+            config LOGI_UDP_POST_HMAC_SECRET
+                string "Compact UDP telemetry HMAC shared secret"
+                depends on LOGI_UDP_POST_ENABLED
+                default ""
+                help
+                    The exact shared-secret string bytes used as the HMAC key.
+                    Hex-looking values are treated as ASCII/UTF-8 text, not
+                    decoded binary hex.
+
         endmenu
 
         menu "Debug Options"

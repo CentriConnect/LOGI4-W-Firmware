@@ -7,6 +7,7 @@
 #include <esp_sleep.h>
 #include <wifi_provisioning/scheme_ble.h>
 #include <ctime>
+#include <cstdio>
 #include <cstring>
 #include "logi/ResetCounter.h"
 #include "logi/Faults.h"
@@ -24,6 +25,64 @@ const char* ProvisioningStateMachine::NVS_WIFI_PASS_KEY = "wifi_pass";
 const char* ProvisioningStateMachine::NVS_BACKUP_SSID_KEY = "backup_ssid";
 const char* ProvisioningStateMachine::NVS_BACKUP_PASS_KEY = "backup_pass";
 static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
+
+static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceSettings,
+                                                         const DeviceShadowState& parsedShadowState)
+{
+    DeviceShadowState reported{};
+
+    if (deviceSettings == nullptr) {
+        return reported;
+    }
+
+    WeeklySchedule schedules[DeviceSettings::MAX_WEEKLY_SCHEDULES];
+    if (deviceSettings->getWeeklySchedules(schedules))
+    {
+        for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES; ++i)
+        {
+            uint8_t dayByteWithEnable = 0;
+            uint8_t hour = 0;
+            uint8_t minute = 0;
+
+            if (schedules[i].DaysOfWeek != 0)
+            {
+                dayByteWithEnable = schedules[i].DaysOfWeek | 0x80;
+                hour = schedules[i].StartTime.Hour;
+                minute = schedules[i].StartTime.Minute;
+            }
+
+            char scheduleBuf[16];
+            snprintf(scheduleBuf, sizeof(scheduleBuf), "%02u:%02u;%02X",
+                     static_cast<unsigned>(hour),
+                     static_cast<unsigned>(minute),
+                     static_cast<unsigned>(dayByteWithEnable));
+            reported.post_schedule[i] = scheduleBuf;
+        }
+    }
+
+    reported.fill_dwell_time = deviceSettings->getFillDwellTime();
+    reported.lte_timeout = deviceSettings->getLteTimeout();
+    reported.fill_alarm_delta = deviceSettings->getFillAlarmDelta();
+    reported.post_dwell_time = deviceSettings->getPostDwellTime();
+    reported.ble_adv_time = deviceSettings->getBleAdvTime();
+
+    char mqttScheduledPost[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+    if (deviceSettings->getMqttScheduledPost(mqttScheduledPost, sizeof(mqttScheduledPost))) {
+        reported.mqtt_scheduled_post = mqttScheduledPost;
+    }
+    reported.event_posts = deviceSettings->getEventPosts();
+    reported.event_posts_valid = true;
+
+    // These fields currently do not have DeviceSettings storage, so report them
+    // only when this cycle successfully parsed them from desired.
+    reported.event_thresholds_pct = parsedShadowState.event_thresholds_pct;
+    reported.sensor_sample_rate = parsedShadowState.sensor_sample_rate;
+    reported.acquire_gps = parsedShadowState.acquire_gps;
+    reported.acquire_gps_valid = parsedShadowState.acquire_gps_valid;
+    reported.mqtt_timeout = parsedShadowState.mqtt_timeout;
+
+    return reported;
+}
 
 ProvisioningStateMachine::ProvisioningStateMachine(EspNvsStorage* nvsStorage,
                                                    EspBluetoothManager* bleManager,
@@ -380,12 +439,21 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
             // REQ-SHADOW: persist each desired-state field. Setters log
             // their own apply/reject so we don't double-log here.
             // 0 means "field not present in shadow" — skip those.
+            if (_parentStateMachine) _parentStateMachine->updateSchedulesFromShadow(shadow);
             if (shadow.fill_dwell_time != 0) _deviceSettings->setFillDwellTime(shadow.fill_dwell_time);
             if (shadow.lte_timeout      != 0) _deviceSettings->setLteTimeout(shadow.lte_timeout);
             if (shadow.fill_alarm_delta != 0) _deviceSettings->setFillAlarmDelta(shadow.fill_alarm_delta);
             if (shadow.post_dwell_time  != 0) _deviceSettings->setPostDwellTime(shadow.post_dwell_time);
             if (shadow.ble_adv_time     != 0) _deviceSettings->setBleAdvTime(shadow.ble_adv_time);
-            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow applied");
+            if (shadow.event_posts_valid) _deviceSettings->setEventPosts(shadow.event_posts);
+            if (!shadow.mqtt_scheduled_post.empty()) _deviceSettings->setMqttScheduledPost(shadow.mqtt_scheduled_post.c_str());
+            _deviceSettings->Commit();
+            DeviceShadowState reported = buildReportedShadowFromSettings(_deviceSettings, shadow);
+            if (_awsIotManager->UpdateShadowWithStatus(reported)) {
+                ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow applied and reported");
+            } else {
+                ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow applied but reported update FAILED");
+            }
         } else {
             ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow fetch %s",
                      ok ? "ok but no DeviceSettings to apply" : "FAILED");

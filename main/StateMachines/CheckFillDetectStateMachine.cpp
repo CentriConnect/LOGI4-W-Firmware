@@ -224,8 +224,15 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckDwellTime()
         s_lastPotentialFillLevel = _currentFillLevel;
 
         // PERFORM POST - fill event triggers posting
+        if (!_deviceSettings.getEventPosts())
+        {
+            ESP_LOGI(TAG, "Fill event confirmed but event_posts is false; not posting event telemetry");
+            _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
+            return;
+        }
+
         ESP_LOGI(TAG, "Enqueuing sensor data for fill-triggered post");
-        _parentStateMachine->addToPostQueue(_sensorData);
+        _parentStateMachine->addToPostQueue(_sensorData, PostTransport::PostTransport_Mqtt);
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
     }
     else
@@ -237,7 +244,6 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckDwellTime()
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
     }
 }
-
 
 
 

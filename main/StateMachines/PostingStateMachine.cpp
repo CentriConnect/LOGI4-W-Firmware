@@ -11,6 +11,8 @@
 #include "hal/EspNvsStorage.h"
 #include "logi/ResetCounter.h"
 #include "logi/Faults.h"
+#include "UDP/UdpTelemetryClient.h"
+#include <cstdio>
 
 static const char *TAG = "PostingStateMachine";
 
@@ -160,6 +162,20 @@ bool PostingStateMachine::publishTelemetrySnapshot(const LogiSensorData& data, c
     return published;
 }
 
+bool PostingStateMachine::publishUdpTelemetrySnapshot(const LogiSensorData& data, const char* label)
+{
+    TelemetryContext telemetryContext;
+    populateTelemetryContext(telemetryContext);
+
+    ESP_LOGI(TAG, "Publishing %s telemetry snapshot (compact UDP)", label ? label : "scheduled");
+    bool published = UdpTelemetryClient::SendTelemetry(data, telemetryContext);
+    if (!published)
+    {
+        Faults_Set(FAULT_AWS);
+    }
+    return published;
+}
+
 void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& shadowState)
 {
     if (_parentStateMachine) {
@@ -181,8 +197,68 @@ void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& s
     if (shadowState.ble_adv_time != 0) {
         _deviceSettings.setBleAdvTime(shadowState.ble_adv_time);
     }
+    if (shadowState.event_posts_valid) {
+        _deviceSettings.setEventPosts(shadowState.event_posts);
+    }
+    if (!shadowState.mqtt_scheduled_post.empty()) {
+        _deviceSettings.setMqttScheduledPost(shadowState.mqtt_scheduled_post.c_str());
+    }
 
     _deviceSettings.Commit();
+}
+
+DeviceShadowState PostingStateMachine::buildReportedShadowFromSettings(const DeviceShadowState& parsedShadowState) const
+{
+    DeviceShadowState reported{};
+
+    WeeklySchedule schedules[DeviceSettings::MAX_WEEKLY_SCHEDULES];
+    if (_deviceSettings.getWeeklySchedules(schedules))
+    {
+        for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES; ++i)
+        {
+            uint8_t dayByteWithEnable = 0;
+            uint8_t hour = 0;
+            uint8_t minute = 0;
+
+            if (schedules[i].DaysOfWeek != 0)
+            {
+                dayByteWithEnable = schedules[i].DaysOfWeek | 0x80;
+                hour = schedules[i].StartTime.Hour;
+                minute = schedules[i].StartTime.Minute;
+            }
+
+            char scheduleBuf[16];
+            snprintf(scheduleBuf, sizeof(scheduleBuf), "%02u:%02u;%02X",
+                     static_cast<unsigned>(hour),
+                     static_cast<unsigned>(minute),
+                     static_cast<unsigned>(dayByteWithEnable));
+            reported.post_schedule[i] = scheduleBuf;
+        }
+    }
+
+    reported.fill_dwell_time = _deviceSettings.getFillDwellTime();
+    reported.lte_timeout = _deviceSettings.getLteTimeout();
+    reported.fill_alarm_delta = _deviceSettings.getFillAlarmDelta();
+    reported.post_dwell_time = _deviceSettings.getPostDwellTime();
+    reported.ble_adv_time = _deviceSettings.getBleAdvTime();
+
+    char mqttScheduledPost[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+    if (_deviceSettings.getMqttScheduledPost(mqttScheduledPost, sizeof(mqttScheduledPost)))
+    {
+        reported.mqtt_scheduled_post = mqttScheduledPost;
+    }
+    reported.event_posts = _deviceSettings.getEventPosts();
+    reported.event_posts_valid = true;
+
+    // These fields currently do not have DeviceSettings storage, so report them
+    // only when this cycle successfully parsed them from desired.
+    reported.event_thresholds_pct = parsedShadowState.event_thresholds_pct;
+    reported.sensor_sample_rate = parsedShadowState.sensor_sample_rate;
+    reported.acquire_gps = parsedShadowState.acquire_gps;
+    reported.acquire_gps_valid = parsedShadowState.acquire_gps_valid;
+    reported.mqtt_timeout = parsedShadowState.mqtt_timeout;
+
+    return reported;
 }
 
 void PostingStateMachine::PostingStateInitialEnter()
@@ -199,6 +275,28 @@ void PostingStateMachine::PostingStateInitialEnter()
     // Record start time (may be invalid if not synced yet, will update after WiFi connects)
     _postStartTime = _timeKeeper->GetCurrentTime();
     ESP_LOGI(TAG, "Starting post timer. Start time: %ld (may update after NTP sync)", (long int)_postStartTime);
+
+    if (_parentStateMachine &&
+        !_parentStateMachine->isPostQueueEmpty() &&
+        _parentStateMachine->peekPostQueueTransport() == PostTransport::PostTransport_Udp)
+    {
+        if (!_timeKeeper->IsTimeSynced())
+        {
+            ESP_LOGI(TAG, "Synchronizing UTC time via NTP before compact UDP post...");
+            if (_timeKeeper->SyncTime())
+            {
+                _postStartTime = _timeKeeper->GetCurrentTime();
+            }
+            else
+            {
+                ESP_LOGW(TAG, "NTP sync failed before UDP post; continuing with cached/invalid timestamp");
+                Faults_Set(FAULT_NTP);
+            }
+        }
+
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
+        return;
+    }
 
     // Proceed to connect - time sync happens after WiFi is connected
     transitionTo(PostingState::PostingState_TryConnect);
@@ -358,7 +456,8 @@ void PostingStateMachine::PostingStateSendGetShadowDelta()
         ESP_LOGI(TAG, "Activation [2/5]: shadow fetched; applying settings to memory");
         applyShadowSettingsToMemory(_shadowState);
 
-        if (_awsIotManager->UpdateShadowWithStatus(_shadowState))
+        DeviceShadowState reportedState = buildReportedShadowFromSettings(_shadowState);
+        if (_awsIotManager->UpdateShadowWithStatus(reportedState))
         {
             ESP_LOGI(TAG, "Shadow reported state updated after applying settings");
         }
@@ -371,7 +470,8 @@ void PostingStateMachine::PostingStateSendGetShadowDelta()
             ESP_LOGW(TAG, "Shadow reset_provisioning flag detected - clearing and rebooting");
 
             _shadowState.reset_provisioning = false;
-            _awsIotManager->UpdateShadowWithStatus(_shadowState);
+            DeviceShadowState reportedState = buildReportedShadowFromSettings(_shadowState);
+            _awsIotManager->UpdateShadowWithStatus(reportedState);
             vTaskDelay(pdMS_TO_TICKS(2000));
 
             EspNvsStorage stateStorage("DeviceState");
@@ -420,14 +520,13 @@ void PostingStateMachine::PostingStateHandleShadowDelta()
     //    onShadowDelta callback in the background.
     _awsIotManager->GetCurrentShadowState(_shadowState);
 
-    // 2. Persist schedules from shadow to DeviceSettings NVS
-    if (_parentStateMachine) {
-        _parentStateMachine->updateSchedulesFromShadow(_shadowState);
-    }
+    // 2. Persist accepted shadow values to DeviceSettings/NVS before reporting.
+    applyShadowSettingsToMemory(_shadowState);
 
     // 3. Post the updated state back to the shadow's "reported" section.
     //    This confirms to the cloud that we have accepted and applied the changes.
-    if (_awsIotManager->UpdateShadowWithStatus(_shadowState))
+    DeviceShadowState reportedState = buildReportedShadowFromSettings(_shadowState);
+    if (_awsIotManager->UpdateShadowWithStatus(reportedState))
     {
         ESP_LOGI(TAG, "Successfully reported the updated shadow state.");
     }
@@ -441,7 +540,8 @@ void PostingStateMachine::PostingStateHandleShadowDelta()
         ESP_LOGW(TAG, "Shadow reset_provisioning flag detected — clearing and rebooting");
 
         _shadowState.reset_provisioning = false;
-        _awsIotManager->UpdateShadowWithStatus(_shadowState);
+        reportedState = buildReportedShadowFromSettings(_shadowState);
+        _awsIotManager->UpdateShadowWithStatus(reportedState);
         vTaskDelay(pdMS_TO_TICKS(2000));
 
         // Set force-provisioning NVS flag (persists across reboot)
@@ -674,9 +774,21 @@ void PostingStateMachine::PostingStateDoPostsFromQueue()
     while (!_parentStateMachine->isPostQueueEmpty())
     {
         const LogiSensorData& data = _parentStateMachine->peekPostQueue();
-        ESP_LOGI(TAG, "Attempting to post next item from queue (LOGI4 format)...");
+        PostTransport transport = _parentStateMachine->peekPostQueueTransport();
+        ESP_LOGI(TAG, "Attempting to post next item from queue (%s)...",
+                 transport == PostTransport::PostTransport_Udp ? "compact UDP" : "LOGI4 MQTT");
 
-        if (_awsIotManager->PostTelemetryLogi4Format(data, telemetryContext))
+        bool posted = false;
+        if (transport == PostTransport::PostTransport_Udp)
+        {
+            posted = UdpTelemetryClient::SendTelemetry(data, telemetryContext);
+        }
+        else
+        {
+            posted = _awsIotManager->PostTelemetryLogi4Format(data, telemetryContext);
+        }
+
+        if (posted)
         {
             ESP_LOGI(TAG, "Post successful for one item.");
             _parentStateMachine->removeFirstFromPostQueue();

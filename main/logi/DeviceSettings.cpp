@@ -14,6 +14,8 @@ const char *DeviceSettings::KEY_LTE_TIMEOUT = "LteTimeout";
 const char *DeviceSettings::KEY_FILL_ALARM_D = "FillAlarmD";
 const char *DeviceSettings::KEY_POST_DWELL_T = "PostDwellT";
 const char *DeviceSettings::KEY_BLE_ADV_T    = "BleAdvT";       // REQ-SHADOW: BLE adv interval (ms)
+const char *DeviceSettings::KEY_EVENT_POSTS = "EventPosts";
+const char *DeviceSettings::KEY_MQTT_SCHED_POST = "MqttSched";
 const char *DeviceSettings::KEY_DEVICE_ID_VALID = "DeviceIdValid";
 const char *DeviceSettings::KEY_DEFAULTS_SET = "DefaultsSet";
 
@@ -31,6 +33,7 @@ DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsSer
                                                                     _fillAlarmDelta(0),
                                                                     _postDwellTime(0),
                                                                     _bleAdvTime(0),
+                                                                    _eventPosts(false),
 
                                                                     _deviceIdValidFlag(0),
                                                                     _defaultsAppliedFlag(0)
@@ -39,6 +42,7 @@ DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsSer
     // Clear string buffers and schedule array initially
     memset(_deviceId, 0, sizeof(_deviceId));
     memset(_softwareResetStatusStr, 0, sizeof(_softwareResetStatusStr));
+    memset(_mqttScheduledPost, 0, sizeof(_mqttScheduledPost));
     memset(_weeklySchedules, 0, sizeof(_weeklySchedules));
 }
 
@@ -91,6 +95,8 @@ bool DeviceSettings::Initialize()
     success &= loadOrDefaultBasicTypeSetting<uint8_t>(KEY_FILL_ALARM_D, _fillAlarmDelta, CONFIG_LOGI_DEFAULT_FILL_PERCENT_DELTA);
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_POST_DWELL_T, _postDwellTime, CONFIG_LOGI_DEFAULT_POST_DWELL_TIME_S);
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_BLE_ADV_T, _bleAdvTime, CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS);
+    success &= loadOrDefaultBasicTypeSetting<bool>(KEY_EVENT_POSTS, _eventPosts, false);
+    success &= loadOrDefaultMqttScheduledPost();
     success &= loadOrDefaultBasicTypeSetting<uint16_t>(KEY_DEVICE_ID_VALID, _deviceIdValidFlag, 0); // Default DeviceId is not valid
 
     if (!success)
@@ -162,6 +168,8 @@ bool DeviceSettings::ApplyDefaults()
     _fillAlarmDelta = CONFIG_LOGI_DEFAULT_FILL_PERCENT_DELTA;
     _postDwellTime = CONFIG_LOGI_DEFAULT_POST_DWELL_TIME_S;
     _bleAdvTime = CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS;
+    _eventPosts = false;
+    _mqttScheduledPost[0] = '\0';
 
     // Default Weekly Schedule
     memset(_weeklySchedules, 0, sizeof(_weeklySchedules));
@@ -183,6 +191,9 @@ bool DeviceSettings::ApplyDefaults()
     success &= _settingsService.SetValue(KEY_LTE_TIMEOUT, reinterpret_cast<const uint8_t *>(&_lteTimeout), sizeof(_lteTimeout));
     success &= _settingsService.SetValue(KEY_FILL_ALARM_D, reinterpret_cast<const uint8_t *>(&_fillAlarmDelta), sizeof(_fillAlarmDelta));
     success &= _settingsService.SetValue(KEY_POST_DWELL_T, reinterpret_cast<const uint8_t *>(&_postDwellTime), sizeof(_postDwellTime));
+    success &= _settingsService.SetValue(KEY_BLE_ADV_T, reinterpret_cast<const uint8_t *>(&_bleAdvTime), sizeof(_bleAdvTime));
+    success &= _settingsService.SetValue(KEY_EVENT_POSTS, _eventPosts);
+    success &= _settingsService.SetValue(KEY_MQTT_SCHED_POST, reinterpret_cast<const uint8_t *>(_mqttScheduledPost), strlen(_mqttScheduledPost) + 1);
     success &= _settingsService.SetValue(KEY_DEFAULTS_SET, reinterpret_cast<const uint8_t *>(&_defaultsAppliedFlag), sizeof(_defaultsAppliedFlag));
     // --- End Save ---
 
@@ -339,6 +350,20 @@ bool DeviceSettings::loadOrDefaultWeeklySchedules()
     return true;
 }
 
+bool DeviceSettings::loadOrDefaultMqttScheduledPost()
+{
+    size_t actual_size = _settingsService.GetValue(KEY_MQTT_SCHED_POST, reinterpret_cast<uint8_t *>(_mqttScheduledPost), MQTT_SCHEDULED_POST_BUFFER_SIZE);
+    if (actual_size > 0 && actual_size <= MQTT_SCHEDULED_POST_BUFFER_SIZE)
+    {
+        _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE - 1] = '\0';
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Setting '%s' not found in NVS. Applying default.", KEY_MQTT_SCHED_POST);
+    _mqttScheduledPost[0] = '\0';
+    return _settingsService.SetValue(KEY_MQTT_SCHED_POST, reinterpret_cast<const uint8_t *>(_mqttScheduledPost), strlen(_mqttScheduledPost) + 1);
+}
+
 // --- Getters ---
 
 bool DeviceSettings::getDeviceId(char *buffer, size_t bufferSize) const
@@ -416,6 +441,23 @@ uint32_t DeviceSettings::getPostDwellTime() const
     if (!_initialized)
         return CONFIG_LOGI_DEFAULT_POST_DWELL_TIME_S;
     return _postDwellTime;
+}
+
+bool DeviceSettings::getEventPosts() const
+{
+    if (!_initialized)
+        return false;
+    return _eventPosts;
+}
+
+bool DeviceSettings::getMqttScheduledPost(char *buffer, size_t bufferSize) const
+{
+    if (!_initialized || buffer == nullptr || bufferSize == 0)
+        return false;
+
+    strncpy(buffer, _mqttScheduledPost, bufferSize);
+    buffer[bufferSize - 1] = '\0';
+    return true;
 }
 
 bool DeviceSettings::isDeviceIdValid() const
@@ -592,6 +634,37 @@ bool DeviceSettings::setBleAdvTime(uint32_t milliseconds)
     bool success = _settingsService.SetValue(KEY_BLE_ADV_T, reinterpret_cast<const uint8_t *>(&_bleAdvTime), sizeof(_bleAdvTime));
     if (!success)
         ESP_LOGE(TAG, "Failed to save BLE ADV Time!");
+    return success;
+}
+
+bool DeviceSettings::setEventPosts(bool enabled)
+{
+    if (!_initialized)
+        return false;
+    ESP_LOGI(TAG, "Setting event_posts to: %s", enabled ? "true" : "false");
+    _eventPosts = enabled;
+    bool success = _settingsService.SetValue(KEY_EVENT_POSTS, _eventPosts);
+    if (!success)
+        ESP_LOGE(TAG, "Failed to save event_posts!");
+    return success;
+}
+
+bool DeviceSettings::setMqttScheduledPost(const char *schedule)
+{
+    if (!_initialized)
+        return false;
+    if (schedule == nullptr)
+        schedule = "";
+
+    ESP_LOGI(TAG, "Setting mqtt_scheduled_post to: %s", schedule);
+    strncpy(_mqttScheduledPost, schedule, MQTT_SCHEDULED_POST_BUFFER_SIZE - 1);
+    _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE - 1] = '\0';
+
+    bool success = _settingsService.SetValue(KEY_MQTT_SCHED_POST,
+                                             reinterpret_cast<const uint8_t *>(_mqttScheduledPost),
+                                             strlen(_mqttScheduledPost) + 1);
+    if (!success)
+        ESP_LOGE(TAG, "Failed to save mqtt_scheduled_post!");
     return success;
 }
 

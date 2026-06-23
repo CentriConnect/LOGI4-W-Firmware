@@ -19,6 +19,7 @@ public:
     // Note: DEVICE_ID_SIZE includes the null terminator from sizeof() in C
     static const size_t DEVICE_ID_BUFFER_SIZE = 37; // UUID string "0000..." length + 1 for null
     static const size_t SW_RESET_STATUS_BUFFER_SIZE = 20;
+    static const size_t MQTT_SCHEDULED_POST_BUFFER_SIZE = 16;
     static const uint16_t DEVICE_ID_VALID_FLAG_VALUE = 0xBAFD;
 // Use the Kconfig value for the defaults applied flag
 // Ensure this is defined in your sdkconfig.h or replace with literal value
@@ -133,6 +134,8 @@ public:
      * REQ-SHADOW: REV B field 'ble_adv_time', min 1000 ms, default 8000 ms.
      */
     uint32_t getBleAdvTime() const;
+    bool getEventPosts() const;
+    bool getMqttScheduledPost(char *buffer, size_t bufferSize) const;
 
     /**
      * @brief Checks if the stored Device ID is considered valid based on the flag.
@@ -195,6 +198,8 @@ public:
      * Values below CONFIG_LOGI_MIN_BLE_ADV_TIME_MS are rejected.
      */
     bool setBleAdvTime(uint32_t milliseconds);
+    bool setEventPosts(bool enabled);
+    bool setMqttScheduledPost(const char *schedule);
 
 private:
     // --- Private Members ---
@@ -210,6 +215,8 @@ private:
     uint8_t _fillAlarmDelta;
     uint32_t _postDwellTime;
     uint32_t _bleAdvTime;       // REQ-SHADOW: BLE adv interval (ms) for prov mode
+    bool _eventPosts;
+    char _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE];
     uint16_t _deviceIdValidFlag;
     uint16_t _defaultsAppliedFlag;
 
@@ -222,6 +229,8 @@ private:
     static const char *KEY_FILL_ALARM_D;
     static const char *KEY_POST_DWELL_T;
     static const char *KEY_BLE_ADV_T;       // REQ-SHADOW
+    static const char *KEY_EVENT_POSTS;
+    static const char *KEY_MQTT_SCHED_POST;
     static const char *KEY_DEVICE_ID_VALID;
     static const char *KEY_DEFAULTS_SET;
 
@@ -263,6 +272,7 @@ private:
      * @return true if loaded or default applied successfully, false on error.
      */
     bool loadOrDefaultWeeklySchedules();
+    bool loadOrDefaultMqttScheduledPost();
 
     /**
      * @brief Converts the internal _softwareResetStatusStr to the enum value.

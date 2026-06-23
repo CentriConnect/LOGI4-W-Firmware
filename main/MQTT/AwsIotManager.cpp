@@ -159,7 +159,6 @@ bool AwsIotManager::SyncDeviceShadow() {
     {
         shadow_state = newState;
         shadow_synced = true;
-        aws_client->UpdateDeviceShadow(shadow_state);
         return true;
     }
     
@@ -239,6 +238,4 @@ void AwsIotManager::onShadowDelta(const DeviceShadowState& deltaState)
     MergeShadowDelta(shadow_state, deltaState);
     shadow_synced = true;
     delta_received_flag = true; 
-    
-    aws_client->UpdateDeviceShadow(shadow_state);
 }

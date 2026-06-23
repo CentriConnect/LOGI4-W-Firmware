@@ -56,6 +56,12 @@ enum class PostingState
     PostingState_PostDwell          // Wait after successful post for cloud commands/OTA
 };
 
+enum class PostTransport
+{
+    PostTransport_Mqtt,
+    PostTransport_Udp
+};
+
 enum class ProvisioningState
 {
     ProvisioningState_Init,             // Initialize BLE provisioning service

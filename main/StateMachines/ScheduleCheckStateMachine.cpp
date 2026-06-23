@@ -7,6 +7,8 @@
 #include "esp_attr.h"
 #include "wifiCredentials.h"
 #include "logi/Faults.h"
+#include <cstdio>
+#include <cstdlib>
 
 static const char *TAG = "ScheduleCheckStateMachine";
 
@@ -23,6 +25,28 @@ static constexpr float BATTERY_POST_THRESHOLD_V = static_cast<float>(CONFIG_LOGI
 
 // Counter for minutes when we don't have valid time (also persisted across sleep)
 RTC_DATA_ATTR static uint32_t minutes_since_last_post = 0;
+
+static bool parseShadowScheduleString(const char* schedule, int& hour, int& minute, uint8_t& daysOfWeek)
+{
+    if (schedule == nullptr || schedule[0] == '\0')
+    {
+        return false;
+    }
+
+    unsigned int dayByte = 0;
+    if (sscanf(schedule, "%d:%d;%x", &hour, &minute, &dayByte) != 3)
+    {
+        return false;
+    }
+
+    if (!(dayByte & 0x80) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    {
+        return false;
+    }
+
+    daysOfWeek = static_cast<uint8_t>(dayByte & 0x7F);
+    return true;
+}
 
 ScheduleCheckStateMachine::ScheduleCheckStateMachine(EspTimeKeeper* timeKeeper, const DeviceSettings& deviceSettings, EspNetworkManager* networkManager, LogiSensorData& sensorData): 
     _timeKeeper(timeKeeper),    
@@ -187,6 +211,14 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
     int currentWday = _timeInfo.tm_wday;
 
     // Check if we're within 5 minutes of any scheduled time
+    PostTransport selectedTransport = PostTransport::PostTransport_Udp;
+    char mqttSchedule[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+    int mqttHour = 0;
+    int mqttMinute = 0;
+    uint8_t mqttDays = 0;
+    bool hasMqttSchedule = _deviceSettings.getMqttScheduledPost(mqttSchedule, sizeof(mqttSchedule)) &&
+                           parseShadowScheduleString(mqttSchedule, mqttHour, mqttMinute, mqttDays);
+
     for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES; ++i)
     {
         if (schedules[i].DaysOfWeek == 0) continue;
@@ -206,6 +238,13 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
                          _timeInfo.tm_min);
 
                 withinScheduledWindow = true;
+                int mqttScheduledMinutes = mqttHour * 60 + mqttMinute;
+                bool matchesMqttSchedule = hasMqttSchedule &&
+                                           (mqttDays & (1 << currentWday)) &&
+                                           (scheduledMinutes == mqttScheduledMinutes);
+                selectedTransport = matchesMqttSchedule
+                    ? PostTransport::PostTransport_Mqtt
+                    : PostTransport::PostTransport_Udp;
                 break; 
             }
         }
@@ -237,7 +276,7 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
         update_last_post_time(static_cast<int64_t>(current_time));
 
         ESP_LOGI(TAG, "Enqueued LOGI Data");
-        _parentStateMachine->addToPostQueue(_sensorData);
+        _parentStateMachine->addToPostQueue(_sensorData, selectedTransport);
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
     }
     else

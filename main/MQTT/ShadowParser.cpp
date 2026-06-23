@@ -79,13 +79,10 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
     if (!state) state = root;
 
     cJSON* configs[] = {
-        cJSON_GetObjectItem(state, "desired"),
-        cJSON_GetObjectItem(state, "reported"),
-        cJSON_GetObjectItem(state, "delta"),
-        state
+        cJSON_GetObjectItem(state, "desired")
     };
     
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 1; i++) {
         cJSON* config = configs[i];
         if (!config) continue;
         

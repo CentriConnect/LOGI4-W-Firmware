@@ -244,7 +244,6 @@ void AwsIotClient::handleMqttEvent(esp_mqtt_event_handle_t event)
             xSemaphoreGive(connection_semaphore);
             
             // Subscribe to shadow topics
-            subscribeToTopic(AWS_IOT_SHADOW_UPDATE_DELTA, 1);
             subscribeToTopic(AWS_IOT_SHADOW_GET_ACCEPTED, 1);
             subscribeToTopic(AWS_IOT_SHADOW_GET_REJECTED, 1);
             subscribeToTopic(AWS_IOT_SHADOW_UPDATE_ACCEPTED, 1);
@@ -293,16 +292,6 @@ void AwsIotClient::handleMqttEvent(esp_mqtt_event_handle_t event)
                 ESP_LOGE(TAG, "Shadow update rejected: %s", data.c_str());
                 shadow_update_success = false;
                 xSemaphoreGive(shadow_semaphore);
-            }
-            else if (topic.find("/shadow/update/delta") != std::string::npos)
-            {
-                DeviceShadowState delta_state;
-                if (parseShadowDocument(data.c_str(), delta_state) && shadow_delta_callback)
-                {
-                    // Merge delta into current state
-                    MergeShadowDelta(current_shadow_state, delta_state);
-                    shadow_delta_callback(current_shadow_state);
-                }
             }
             else if (generic_message_callback)
             {
