@@ -13,6 +13,8 @@ static RTC_DATA_ATTR int s_last_batt_temp_mv_filtered = 0;
 static RTC_DATA_ATTR bool s_last_ambient_valid = false;
 static RTC_DATA_ATTR float s_last_ambient_c = 0.0f;
 static RTC_DATA_ATTR float s_last_humidity_pct = 0.0f;
+static RTC_DATA_ATTR bool s_last_gps_valid = false;
+static RTC_DATA_ATTR GpsData_t s_last_gps_data = {};
 
 // Platform-specific includes for logging and delays
 #ifdef ESP_PLATFORM 
@@ -258,6 +260,7 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
 
 void LogiHardwareDriver::UpdateI2cReadingsAndFilters()
 { 
+    static uint32_t s_sht4xReadFailCount = 0;
     float temp = 0.0f;
     float hum = 0.0f;
 
@@ -279,13 +282,24 @@ void LogiHardwareDriver::UpdateI2cReadingsAndFilters()
         s_last_ambient_valid = true;
         s_last_ambient_c = temp;
         s_last_humidity_pct = hum;
+        if (s_sht4xReadFailCount > 0)
+        {
+            LOGI_DRV_LOG_INF("SHT4x ambient sensor recovered after %lu failed reads",
+                             static_cast<unsigned long>(s_sht4xReadFailCount));
+            s_sht4xReadFailCount = 0;
+        }
 
         LOGI_DRV_LOG_DBG("I2C Update: Temp %.2f (Truncated: %u), Hum %.2f (Truncated: %u)",
                          temp, temp_truncated, hum, hum_truncated);
     }
     else
     {
-        LOGI_DRV_LOG_ERR("Failed to read Temperature Sensor (SHT4x)");
+        s_sht4xReadFailCount++;
+        if (s_sht4xReadFailCount == 1 || (s_sht4xReadFailCount % 10) == 0)
+        {
+            LOGI_DRV_LOG_WRN("Failed to read Temperature Sensor (SHT4x), count=%lu",
+                             static_cast<unsigned long>(s_sht4xReadFailCount));
+        }
         Faults_Set(FAULT_AMB);
         // Do not add samples if read failed
     }
@@ -351,26 +365,6 @@ bool LogiHardwareDriver::SaturateFilters()
     DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
-    LOGI_DRV_LOG_INF("Enabling GNSS power (GPIO HIGH)...");
-    HalGpioError gnssErr = _gnssEnableGpio.Write(true);  // Enable GNSS power for GPS acquisition
-    if (gnssErr != HAL_GPIO_OK)
-    {
-        LOGI_DRV_LOG_ERR("Failed to enable GNSS GPIO! Error: %d", gnssErr);
-    }
-    else
-    {
-        LOGI_DRV_LOG_INF("GNSS GPIO set HIGH successfully");
-    }
-
-    // Ensure GNSS_RESET_N is HIGH (active LOW, so HIGH = not in reset)
-    _gnssResetGpio.Write(true);
-    LOGI_DRV_LOG_INF("GNSS Reset released (HIGH)");
-
-    DelayMs(100);  // Wait for GPS module power stabilization
-
-    // Wake up GPS module from standby mode (if in standby)
-    // _gps_sensor.WakeUp();  // DISABLED - testing if this interferes with GPS init
-
     if (_batteryMovingAverageFilter.isFull())
     {
        LOGI_DRV_LOG_INF("Filters already saturated.");
@@ -406,7 +400,7 @@ bool LogiHardwareDriver::SaturateFilters()
     _measureGpio.Write(false);
     _sensorPowerGpio.Write(false);
     // REQ-I2C-01 / SPS: keep SPS HIGH (see above)
-    // Note: Keep GNSS enabled - it will be disabled after GPS data is read in GetLatestSensorData
+    _gnssEnableGpio.Write(false);
 
     LOGI_DRV_LOG_INF("Filters saturated.");
     // Log final filtered values (keep this)
@@ -428,10 +422,6 @@ void LogiHardwareDriver::UpdateMeasurements()
     DelayMs(50);
     _measureGpio.Write(true);
     DelayMs(50);  // Allow I2C sensors (SHT4x) to stabilize after power-on
-    _gnssEnableGpio.Write(true);  // Enable GNSS power for GPS acquisition
-    _gnssResetGpio.Write(true);   // Ensure GNSS_RESET_N is HIGH (not in reset)
-    DelayMs(100);  // Wait for GPS module power stabilization
-
     // Read I2C sensor FIRST before any GPS activity
     UpdateI2cReadingsAndFilters(); // Now filters temp/hum (with truncation)
 
@@ -440,7 +430,7 @@ void LogiHardwareDriver::UpdateMeasurements()
     _measureGpio.Write(false);
     _sensorPowerGpio.Write(false);
     // REQ-I2C-01 / SPS: keep SPS HIGH (see SaturateFilters comment)
-    // Note: Keep GNSS enabled - it will be disabled after GPS data is read
+    _gnssEnableGpio.Write(false);
     LOGI_DRV_LOG_DBG("Measurements updated.");
 
     // Log final filtered values for debugging
@@ -535,7 +525,21 @@ void LogiHardwareDriver::GetLatestSensorData(LogiSensorData &sensorData)
         sensorData.MeasuredHumidityPercentage = 0.0f;
     }
 
-    _gps_sensor.GetGpsData(sensorData.GPSData);
+    GpsData_t gpsData{};
+    if (_gps_sensor.GetGpsData(gpsData) && gpsData.valid)
+    {
+        sensorData.GPSData = gpsData;
+        s_last_gps_data = gpsData;
+        s_last_gps_valid = true;
+    }
+    else if (s_last_gps_valid)
+    {
+        sensorData.GPSData = s_last_gps_data;
+    }
+    else
+    {
+        sensorData.GPSData = gpsData;
+    }
 
     // Disable GNSS power after reading GPS data to save power
     _gnssEnableGpio.Write(false);
@@ -864,7 +868,18 @@ bool LogiHardwareDriver::IsPowerErrorActive()
 
 bool LogiHardwareDriver::GetGpsData(GpsData_t& gpsData)
 {
-    return _gps_sensor.GetGpsData(gpsData);
+    if (_gps_sensor.GetGpsData(gpsData) && gpsData.valid)
+    {
+        s_last_gps_data = gpsData;
+        s_last_gps_valid = true;
+        return true;
+    }
+
+    if (s_last_gps_valid)
+    {
+        gpsData = s_last_gps_data;
+    }
+    return false;
 }
 
 void LogiHardwareDriver::PrintGpsStatus()

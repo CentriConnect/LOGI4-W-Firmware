@@ -17,9 +17,11 @@
 static const char *TAG = "PostingStateMachine";
 
 PostingStateMachine::PostingStateMachine(AwsIotManager* awsIotManager, EspTimeKeeper* timeKeeper,
+                                         ILogiHardwareDriver* driver,
                                          LogiSensorData& sensorData, DeviceSettings& deviceSettings):
       _awsIotManager(awsIotManager),
       _timeKeeper(timeKeeper),
+      _driver(driver),
       _sensorData(sensorData),
       _deviceSettings(deviceSettings),
       _postSuccessful(false),
@@ -32,6 +34,10 @@ void PostingStateMachine::update()
 {
     // Check connection timeout (uses configurable value from shadow, internally renamed from lte_timeout)
     uint32_t connectionTimeout = getConnectionTimeoutSeconds();
+    if (currentState == PostingState::PostingState_TryConnect)
+    {
+        connectionTimeout = (getMqttWaterfallTimeoutSeconds() * 2U) + 30U;
+    }
     if (_postStartTime != 0 && (_timeKeeper->GetCurrentTime() - _postStartTime) > connectionTimeout)
     {
         ESP_LOGE(TAG, "Posting process timed out after %lu seconds!", (unsigned long)connectionTimeout);
@@ -176,6 +182,62 @@ bool PostingStateMachine::publishUdpTelemetrySnapshot(const LogiSensorData& data
     return published;
 }
 
+bool PostingStateMachine::acquireGpsForMqttPost(LogiSensorData& data)
+{
+    if (!_shadowState.acquire_gps_valid || !_shadowState.acquire_gps)
+    {
+        ESP_LOGI(TAG, "Shadow acquire_gps is false/not set; skipping GPS acquisition for MQTT post");
+        return false;
+    }
+
+    if (_driver == nullptr)
+    {
+        ESP_LOGW(TAG, "Shadow acquire_gps is true, but no hardware driver is available");
+        return false;
+    }
+
+    const uint32_t timeoutMs = getPostDwellTimeSeconds() * 1000U;
+    constexpr uint32_t GPS_POLL_MS = 1000;
+    uint32_t waitedMs = 0;
+
+    ESP_LOGI(TAG, "Shadow acquire_gps is true; acquiring GPS fix for MQTT post, timeout=%lu ms",
+             static_cast<unsigned long>(timeoutMs));
+    _driver->SetGnssPower(true);
+
+    while (!_driver->HasValidGpsFix() && waitedMs < timeoutMs)
+    {
+        vTaskDelay(pdMS_TO_TICKS(GPS_POLL_MS));
+        waitedMs += GPS_POLL_MS;
+
+        if ((waitedMs % 10000U) == 0U)
+        {
+            ESP_LOGI(TAG, "Waiting for GPS fix before MQTT telemetry: %lu/%lu ms",
+                     static_cast<unsigned long>(waitedMs),
+                     static_cast<unsigned long>(timeoutMs));
+            _driver->PrintGpsStatus();
+        }
+    }
+
+    GpsData_t gpsData{};
+    bool gotFix = _driver->GetGpsData(gpsData) && gpsData.valid;
+    _driver->SetGnssPower(false);
+
+    if (gotFix)
+    {
+        data.GPSData = gpsData;
+        ESP_LOGI(TAG, "MQTT post GPS fix acquired: lat=%.6f lon=%.6f alt=%.1f rssi=%d",
+                 data.GPSData.latitude,
+                 data.GPSData.longitude,
+                 data.GPSData.altitude,
+                 data.GPSData.rssi);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "GPS fix not acquired before post_dwell_time timeout; using last saved/default coordinates");
+    Faults_Set(FAULT_GPS);
+    return false;
+}
+
 void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& shadowState)
 {
     if (_parentStateMachine) {
@@ -197,8 +259,17 @@ void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& s
     if (shadowState.ble_adv_time != 0) {
         _deviceSettings.setBleAdvTime(shadowState.ble_adv_time);
     }
+    if (shadowState.mqtt_timeout != 0) {
+        _deviceSettings.setMqttTimeout(shadowState.mqtt_timeout);
+    }
+    if (shadowState.sensor_sample_rate != 0) {
+        _deviceSettings.setSensorSampleRateMinutes(shadowState.sensor_sample_rate);
+    }
     if (shadowState.event_posts_valid) {
         _deviceSettings.setEventPosts(shadowState.event_posts);
+    }
+    if (!shadowState.event_thresholds_pct.empty()) {
+        _deviceSettings.setEventThresholdsPct(shadowState.event_thresholds_pct.c_str());
     }
     if (!shadowState.mqtt_scheduled_post.empty()) {
         _deviceSettings.setMqttScheduledPost(shadowState.mqtt_scheduled_post.c_str());
@@ -249,11 +320,16 @@ DeviceShadowState PostingStateMachine::buildReportedShadowFromSettings(const Dev
     }
     reported.event_posts = _deviceSettings.getEventPosts();
     reported.event_posts_valid = true;
+    char eventThresholds[DeviceSettings::EVENT_THRESHOLDS_BUFFER_SIZE] = {0};
+    if (_deviceSettings.getEventThresholdsPct(eventThresholds, sizeof(eventThresholds)))
+    {
+        reported.event_thresholds_pct = eventThresholds;
+    }
+
+    reported.sensor_sample_rate = _deviceSettings.getSensorSampleRateMinutes();
 
     // These fields currently do not have DeviceSettings storage, so report them
     // only when this cycle successfully parsed them from desired.
-    reported.event_thresholds_pct = parsedShadowState.event_thresholds_pct;
-    reported.sensor_sample_rate = parsedShadowState.sensor_sample_rate;
     reported.acquire_gps = parsedShadowState.acquire_gps;
     reported.acquire_gps_valid = parsedShadowState.acquire_gps_valid;
     reported.mqtt_timeout = parsedShadowState.mqtt_timeout;
@@ -275,6 +351,17 @@ void PostingStateMachine::PostingStateInitialEnter()
     // Record start time (may be invalid if not synced yet, will update after WiFi connects)
     _postStartTime = _timeKeeper->GetCurrentTime();
     ESP_LOGI(TAG, "Starting post timer. Start time: %ld (may update after NTP sync)", (long int)_postStartTime);
+
+    if (!_parentStateMachine || !_parentStateMachine->checkAndConnectWifi())
+    {
+        ESP_LOGW(TAG, "Wi-Fi connect failed or provisioning started; leaving posting state");
+        if (_parentStateMachine && !_parentStateMachine->isPostQueueEmpty())
+        {
+            Faults_Set(FAULT_WIFI);
+        }
+        transitionTo(PostingState::PostingState_ExitAWS);
+        return;
+    }
 
     if (_parentStateMachine &&
         !_parentStateMachine->isPostQueueEmpty() &&
@@ -322,7 +409,7 @@ void PostingStateMachine::PostingStateExitAWS()
 
 void PostingStateMachine::PostingStateTryConnect()
 {   
-    ESP_LOGI(TAG, "Attempting to connect to AWS IoT... (Attempt %d/%d)", static_cast<unsigned int>(_connectRetryCount + 1), static_cast<unsigned int>(MAX_CONNECT_RETRIES));
+    ESP_LOGI(TAG, "Attempting AWS IoT MQTT waterfall");
 
     if (!_timeKeeper->IsTimeSynced())
     {
@@ -352,37 +439,19 @@ void PostingStateMachine::PostingStateTryConnect()
         }
     }
     
-    // The Connect() method returns true if successful
-    if (_awsIotManager->Connect())
+    if (_awsIotManager->ConnectWithWaterfall(getMqttWaterfallTimeoutSeconds()))
     {
         ESP_LOGI(TAG, "Connection successful.");
         _connectRetryCount = 0;  // Reset retry counter on success
-        // Move to AWS Connected state
         ESP_LOGI(TAG, "AWS IoT connection established successfully");
 
-        transitionTo(PostingState::PostingState_PostImmediateTelemetry);
+        transitionTo(PostingState::PostingState_SendGetShadowDelta);
     }
     else
     {
-        ESP_LOGE(TAG, "Connection failed.");
+        ESP_LOGE(TAG, "AWS MQTT waterfall failed; falling back queued MQTT post(s) to UDP.");
         Faults_Set(FAULT_AWS);
-        _connectRetryCount++;
-
-        // Check if we've exceeded max retries
-        if (_connectRetryCount >= MAX_CONNECT_RETRIES)
-        {
-            ESP_LOGE(TAG, "Max connection retries exceeded. Exiting.");
-
-            transitionTo(PostingState::PostingState_ExitAWS);
-        } 
-        else 
-        {
-            // Stay in TryConnect state for retry (will be called again on next update)
-            uint32_t delayMs = 1000 * (1 << (_connectRetryCount - 1)); // Exponential backoff: 1s, 2s
-            ESP_LOGI(TAG, "Will retry connection in %lu ms...", delayMs);
-            vTaskDelay(pdMS_TO_TICKS(delayMs));
-            // Stay in current state for retry
-        }
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
     }
 }
 
@@ -564,7 +633,14 @@ void PostingStateMachine::PostingStateCheckFOTA()
 {
     ESP_LOGI(TAG, "Current State: PostingStateCheckFOTA");
 
-    ESP_LOGI(TAG, "Activation [3/5]: checking AWS IoT jobs / OTA");
+    if (_awsIotManager->IsConnectedViaBackup443())
+    {
+        ESP_LOGW(TAG, "Connected via AWS MQTT backup 443; skipping jobs/OTA on this link");
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Checking AWS IoT jobs / OTA before MQTT telemetry");
 
     if (_awsIotManager->GetJobsHandler() == nullptr)
     {
@@ -583,7 +659,7 @@ void PostingStateMachine::PostingStateCheckFOTA()
     if (!jobsHandler) 
     {
         ESP_LOGW(TAG, "Jobs handler not initialized");
-        transitionTo(PostingState::PostingState_AcquireFinalSample);
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
         return;
     }
     
@@ -616,13 +692,13 @@ void PostingStateMachine::PostingStateCheckFOTA()
             ESP_LOGI(TAG, "Firmware already up to date");
             
             jobsHandler->UpdateJobStatus(job.job_id, JobExecutionStatus::SUCCEEDED, "Firmware already up to date");
-            transitionTo(PostingState::PostingState_AcquireFinalSample);
+            transitionTo(PostingState::PostingState_DoPostsFromQueue);
         }
     } 
     else 
     {
         ESP_LOGI(TAG, "No pending FOTA jobs");
-        transitionTo(PostingState::PostingState_AcquireFinalSample);
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
     }
 }
 
@@ -634,7 +710,7 @@ void PostingStateMachine::PostingStateDoFOTAUpdate()
     if (!jobsHandler || !_currentFotaJob.has_value()) 
     {
         ESP_LOGE(TAG, "No FOTA job to process");
-        transitionTo(PostingState::PostingState_AcquireFinalSample);
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
         return;
     }
     
@@ -666,7 +742,7 @@ void PostingStateMachine::PostingStateDoFOTAUpdate()
         
     }
 
-    transitionTo(PostingState::PostingState_AcquireFinalSample);
+    transitionTo(PostingState::PostingState_DoPostsFromQueue);
 }
 
 void PostingStateMachine::PostingStateAcquireFinalSample()
@@ -773,7 +849,7 @@ void PostingStateMachine::PostingStateDoPostsFromQueue()
 
     while (!_parentStateMachine->isPostQueueEmpty())
     {
-        const LogiSensorData& data = _parentStateMachine->peekPostQueue();
+        LogiSensorData data = _parentStateMachine->peekPostQueue();
         PostTransport transport = _parentStateMachine->peekPostQueueTransport();
         ESP_LOGI(TAG, "Attempting to post next item from queue (%s)...",
                  transport == PostTransport::PostTransport_Udp ? "compact UDP" : "LOGI4 MQTT");
@@ -783,8 +859,14 @@ void PostingStateMachine::PostingStateDoPostsFromQueue()
         {
             posted = UdpTelemetryClient::SendTelemetry(data, telemetryContext);
         }
+        else if (!_awsIotManager->GetAwsClient()->IsConnected())
+        {
+            ESP_LOGW(TAG, "MQTT unavailable; sending queued MQTT post via compact UDP fallback");
+            posted = UdpTelemetryClient::SendTelemetry(data, telemetryContext);
+        }
         else
         {
+            acquireGpsForMqttPost(data);
             posted = _awsIotManager->PostTelemetryLogi4Format(data, telemetryContext);
         }
 
@@ -806,14 +888,11 @@ void PostingStateMachine::PostingStateDoPostsFromQueue()
         ESP_LOGI(TAG, "Post queue is now empty.");
     }
 
-    // If at least one post succeeded, enter dwell state to wait for cloud commands
     if (anyPostSucceeded)
     {
         _postSuccessful = true;
-        _dwellStartTime = _timeKeeper->GetCurrentTime();
-        ESP_LOGI(TAG, "Post successful, entering post dwell state for %lu seconds",
-                 (unsigned long)getPostDwellTimeSeconds());
-        transitionTo(PostingState::PostingState_PostDwell);
+        ESP_LOGI(TAG, "Post successful; exiting immediately to sleep");
+        transitionTo(PostingState::PostingState_ExitAWS);
     }
     else
     {
@@ -860,6 +939,16 @@ uint32_t PostingStateMachine::getConnectionTimeoutSeconds() const
         timeout = CONFIG_LOGI_MIN_LTE_TIMEOUT_S;
     }
 
+    return timeout;
+}
+
+uint32_t PostingStateMachine::getMqttWaterfallTimeoutSeconds() const
+{
+    uint32_t timeout = _deviceSettings.getMqttTimeout();
+    if (timeout < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+    {
+        timeout = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;
+    }
     return timeout;
 }
 
@@ -940,20 +1029,17 @@ void PostingStateMachine::populateTelemetryContext(TelemetryContext& ctx) const
         ctx.lteSignalQualityValid = true;
     }
 
-    // === Charge Percent ===
-    ctx.chargerStatus = _sensorData.PublishedBatteryLevel;
+    // === Charger Status ===
+    ctx.chargerStatus = (_driver != nullptr && _driver->IsChargingErrorActive()) ? 1 : 0;
     ctx.chargerStatusValid = true;
 
     // === BLE Status (not implemented in WiFi variant) ===
     ctx.bleStatus = 0;
     ctx.bleStatusValid = true;
 
-    // === Device Status + Error Log (rendered from the per-post fault accumulator) ===
-    uint32_t fault_status = 0;
-    Faults_Render(ctx.errorLog, sizeof(ctx.errorLog), &fault_status);
-    ctx.deviceStatus = (int32_t)fault_status;
+    // === Error Log (rendered from the per-post fault accumulator) ===
+    Faults_Render(ctx.errorLog, sizeof(ctx.errorLog), nullptr);
     ctx.errorLogValid = true;
-    ctx.deviceStatusValid = true;
 
     // === Reset Counter ===
     ctx.resetCounter = LogiResetCounter_Get();
@@ -1012,4 +1098,36 @@ void PostingStateMachine::populateTelemetryContext(TelemetryContext& ctx) const
     // BLE advertising interval
     ctx.bleAdvTime = _deviceSettings.getBleAdvTime();
     ctx.bleAdvTimeValid = true;
+
+    // Sensor sample rate in minutes
+    ctx.sensorSampleRateMinutes = _deviceSettings.getSensorSampleRateMinutes();
+    ctx.sensorSampleRateMinutesValid = true;
+
+    // MQTT connection port used for this publish
+    strncpy(ctx.mqttPort,
+            (_awsIotManager != nullptr && _awsIotManager->IsConnectedViaBackup443()) ? "443" : "8883",
+            sizeof(ctx.mqttPort) - 1);
+    ctx.mqttPort[sizeof(ctx.mqttPort) - 1] = '\0';
+    ctx.mqttPortValid = true;
+
+    // MQTT scheduled post echo
+    char mqttScheduledPost[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+    if (_deviceSettings.getMqttScheduledPost(mqttScheduledPost, sizeof(mqttScheduledPost)))
+    {
+        strncpy(ctx.mqttScheduledPost, mqttScheduledPost, sizeof(ctx.mqttScheduledPost) - 1);
+        ctx.mqttScheduledPost[sizeof(ctx.mqttScheduledPost) - 1] = '\0';
+        ctx.mqttScheduledPostValid = true;
+    }
+
+    // Event settings echo
+    ctx.eventPosts = _deviceSettings.getEventPosts();
+    ctx.eventPostsValid = true;
+
+    char eventThresholds[DeviceSettings::EVENT_THRESHOLDS_BUFFER_SIZE] = {0};
+    if (_deviceSettings.getEventThresholdsPct(eventThresholds, sizeof(eventThresholds)) && eventThresholds[0] != '\0')
+    {
+        strncpy(ctx.eventThresholdsPct, eventThresholds, sizeof(ctx.eventThresholdsPct) - 1);
+        ctx.eventThresholdsPct[sizeof(ctx.eventThresholdsPct) - 1] = '\0';
+        ctx.eventThresholdsPctValid = true;
+    }
 }

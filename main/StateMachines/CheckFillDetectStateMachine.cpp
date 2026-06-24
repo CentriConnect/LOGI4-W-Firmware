@@ -12,7 +12,7 @@ static const char *TAG = "CheckFillDetectStateMachine";
 RTC_DATA_ATTR static bool s_inDwell = false;
 RTC_DATA_ATTR static float s_lastStableLevel = 0.0f;
 RTC_DATA_ATTR static float s_lastPotentialFillLevel = 0.0f;
-RTC_DATA_ATTR static uint32_t s_dwellMinutes = 0;
+RTC_DATA_ATTR static int64_t s_dwellDeadline = 0;
 
 
 CheckFillDetectStateMachine::CheckFillDetectStateMachine(EspTimeKeeper* timeKeeper, const DeviceSettings& deviceSettings, LogiSensorData& sensorData):
@@ -23,7 +23,7 @@ CheckFillDetectStateMachine::CheckFillDetectStateMachine(EspTimeKeeper* timeKeep
     // Restore state from RTC memory
     _inDwell = s_inDwell;
     _lastStableLevel = s_lastStableLevel;
-    _dwellMinutes = s_dwellMinutes;
+    _dwellDeadline = s_dwellDeadline;
 }
 
 void CheckFillDetectStateMachine::update() 
@@ -74,12 +74,11 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckInDwellMode()
     // CRITICAL: Always read current fuel level first before any comparisons
     _currentFillLevel = _sensorData.PublishedFuelLevel;
 
-    ESP_LOGI(TAG, "Fill Detection - Current: %.1f%%, LastStable: %.1f%%, InDwell: %s, DwellMinutes: %lu",
-             _currentFillLevel, _lastStableLevel, _inDwell ? "YES" : "NO", (unsigned long)_dwellMinutes);
+    ESP_LOGI(TAG, "Fill Detection - Current: %.1f%%, LastStable: %.1f%%, InDwell: %s, Deadline: %lld",
+             _currentFillLevel, _lastStableLevel, _inDwell ? "YES" : "NO", _dwellDeadline);
 
     if (_inDwell)
     {
-        // Get and validate fill dwell time (in seconds, convert to minutes for comparison)
         _fillDwellTime = _deviceSettings.getFillDwellTime();
         if (_fillDwellTime < CONFIG_LOGI_MIN_FILL_DWELL_TIME_S)
         {
@@ -92,11 +91,16 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckInDwellMode()
     {
         // Get fill alarm delta setting
         _fillAlarmDelta = _deviceSettings.getFillAlarmDelta();
+        _fillDwellTime = _deviceSettings.getFillDwellTime();
 
         // Apply minimum delta if configured
         if (_fillAlarmDelta < CONFIG_LOGI_MIN_FILL_PERCENT_DELTA)
         {
             _fillAlarmDelta = CONFIG_LOGI_MIN_FILL_PERCENT_DELTA;
+        }
+        if (_fillDwellTime < CONFIG_LOGI_MIN_FILL_DWELL_TIME_S)
+        {
+            _fillDwellTime = CONFIG_LOGI_MIN_FILL_DWELL_TIME_S;
         }
 
         transitionTo(CheckFillDetectState::CheckFillDetectState_CompareFuelLevelsWithDelta);
@@ -115,18 +119,7 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCompareFuelLevels()
         ESP_LOGI(TAG, "Level dropped during dwell: %.1f%% (was %.1f%%) - Canceling fill detection",
                     _currentFillLevel, s_lastPotentialFillLevel);
 
-        // Cancel fill detection - false alarm or tank usage during fill
-        _inDwell = false;
-        _dwellMinutes = 0;
-        _lastStableLevel = _currentFillLevel;
-
-        // Save to RTC memory
-        s_inDwell = _inDwell;
-        s_dwellMinutes = _dwellMinutes;
-        s_lastStableLevel = _lastStableLevel;
-        s_lastPotentialFillLevel = _currentFillLevel;
-
-        // Exit to schedule check - no post
+        clearDwellState(_currentFillLevel);
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
         return;
     }
@@ -138,19 +131,12 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCompareFuelLevels()
                     _currentFillLevel, s_lastPotentialFillLevel);
 
         s_lastPotentialFillLevel = _currentFillLevel;
-        _dwellMinutes = 0;  // Restart dwell counter
+        _dwellDeadline = static_cast<int64_t>(_timeKeeper->GetCurrentTime()) + _fillDwellTime;
+        persistDwellState();
 
-        // Save to RTC memory
-        s_dwellMinutes = _dwellMinutes;
-
-        // Stay in dwell state, go back to sleep
-        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
+        sleepUntilNextWake();
         return;
     }
-
-    // Level is stable - increment dwell counter and check if dwell complete
-    _dwellMinutes++;
-    s_dwellMinutes = _dwellMinutes;
 
     transitionTo(CheckFillDetectState::CheckFillDetectState_CheckDwellTime);
 }
@@ -159,24 +145,18 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCompareFuelLevelsWithDelta
     ESP_LOGI(TAG, "Entered State CheckFillDetectStateCompareFuelLevelsWithDelta");
     // _currentFillLevel already set in CheckInDwellMode
 
-    if (_currentFillLevel > (_lastStableLevel + _fillAlarmDelta))
+    if (_currentFillLevel >= (_lastStableLevel + _fillAlarmDelta))
     {
         ESP_LOGI(TAG, "Fill rise detected: Level rose from %.1f%% to %.1f%% (delta: %u%%)",
                     _lastStableLevel, _currentFillLevel, _fillAlarmDelta);
 
         // Start dwell period - enter fill detection mode
         _inDwell = true;
-        _dwellMinutes = 0;
-
-        // Save to RTC memory - track both the stable level and the potential fill level
-        s_inDwell = _inDwell;
-        s_dwellMinutes = _dwellMinutes;
+        _dwellDeadline = static_cast<int64_t>(_timeKeeper->GetCurrentTime()) + _fillDwellTime;
         s_lastPotentialFillLevel = _currentFillLevel;
-        // Note: Don't update s_lastStableLevel yet - we need to keep the baseline
-        // until the fill is confirmed or cancelled
+        persistDwellState();
 
-        // Go back to sleep - dwell period starts
-        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
+        sleepUntilNextWake();
     }
     else
     {
@@ -196,54 +176,73 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckDwellTime()
 {
     ESP_LOGI(TAG, "Entered State CheckFillDetectStateCheckDwellTime");
 
-    // Convert fill dwell time from seconds to minutes for comparison
-    // _fillDwellTime is already validated and set in CheckInDwellMode
-    uint32_t dwellTimeMinutes = _fillDwellTime / 60;
-    if (dwellTimeMinutes == 0)
+    time_t now = _timeKeeper->GetCurrentTime();
+    if (_dwellDeadline <= 0)
     {
-        dwellTimeMinutes = 1;  // Minimum 1 minute
+        _dwellDeadline = static_cast<int64_t>(now) + _fillDwellTime;
+        persistDwellState();
     }
 
-    ESP_LOGI(TAG, "Dwell check: %lu minutes elapsed, %lu minutes required",
-             (unsigned long)_dwellMinutes, (unsigned long)dwellTimeMinutes);
+    int64_t remaining = _dwellDeadline - static_cast<int64_t>(now);
+    ESP_LOGI(TAG, "Fill dwell check: now=%lld, deadline=%lld, remaining=%lld seconds",
+             static_cast<int64_t>(now), _dwellDeadline, remaining);
 
-    if (_dwellMinutes >= dwellTimeMinutes)
+    if (remaining <= 0)
     {
-        ESP_LOGI(TAG, "Fill event CONFIRMED after %lu minute dwell: Final level %.1f%%",
-                 (unsigned long)_dwellMinutes, _currentFillLevel);
-
-        // Reset tracking - fill is confirmed
-        _inDwell = false;
-        _dwellMinutes = 0;
-        _lastStableLevel = _currentFillLevel;
-
-        // Save to RTC memory
-        s_inDwell = _inDwell;
-        s_dwellMinutes = _dwellMinutes;
-        s_lastStableLevel = _lastStableLevel;
-        s_lastPotentialFillLevel = _currentFillLevel;
-
-        // PERFORM POST - fill event triggers posting
-        if (!_deviceSettings.getEventPosts())
-        {
-            ESP_LOGI(TAG, "Fill event confirmed but event_posts is false; not posting event telemetry");
-            _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
-            return;
-        }
-
-        ESP_LOGI(TAG, "Enqueuing sensor data for fill-triggered post");
-        _parentStateMachine->addToPostQueue(_sensorData, PostTransport::PostTransport_Mqtt);
+        ESP_LOGI(TAG, "Fill event confirmed after dwell: Final level %.1f%%", _currentFillLevel);
+        enqueueFinalFillUdpPost();
+        clearDwellState(_sensorData.PublishedFuelLevel);
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
     }
     else
     {
-        ESP_LOGI(TAG, "Dwell not complete - continuing to wait (%lu/%lu minutes)",
-                 (unsigned long)_dwellMinutes, (unsigned long)dwellTimeMinutes);
-
-        // DO NOT PERFORM POST - continue waiting, go to schedule check
-        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
+        ESP_LOGI(TAG, "Fill dwell not complete - skipping scheduled UDP checks until dwell completes");
+        sleepUntilNextWake();
     }
 }
 
+void CheckFillDetectStateMachine::persistDwellState()
+{
+    s_inDwell = _inDwell;
+    s_lastStableLevel = _lastStableLevel;
+    s_lastPotentialFillLevel = _currentFillLevel > s_lastPotentialFillLevel ? _currentFillLevel : s_lastPotentialFillLevel;
+    s_dwellDeadline = _dwellDeadline;
+}
 
+void CheckFillDetectStateMachine::clearDwellState(float stableLevel)
+{
+    _inDwell = false;
+    _dwellDeadline = 0;
+    _lastStableLevel = stableLevel;
+    s_inDwell = false;
+    s_lastStableLevel = stableLevel;
+    s_lastPotentialFillLevel = stableLevel;
+    s_dwellDeadline = 0;
+}
 
+void CheckFillDetectStateMachine::sleepUntilNextWake()
+{
+    if (_parentStateMachine)
+    {
+        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
+    }
+}
+
+void CheckFillDetectStateMachine::enqueueFinalFillUdpPost()
+{
+    if (_parentStateMachine)
+    {
+        ILogiHardwareDriver* driver = _parentStateMachine->GetHardwareDriver();
+        if (driver)
+        {
+            ESP_LOGI(TAG, "Resampling sensors/peripherals before final fill UDP post");
+            driver->UpdateMeasurements();
+            driver->GetLatestSensorData(_sensorData);
+            driver->SetGnssPower(false);
+            _sensorData.elapsedTimeStampS = static_cast<uint32_t>(_timeKeeper->GetCurrentTime());
+        }
+
+        ESP_LOGI(TAG, "Enqueuing final fill telemetry as compact UDP");
+        _parentStateMachine->addToPostQueue(_sensorData, PostTransport::PostTransport_Udp);
+    }
+}

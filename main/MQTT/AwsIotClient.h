@@ -12,6 +12,12 @@
 #include <atomic>
 #include <functional>
 
+enum class AwsIotConnectionProfile
+{
+    Primary8883,
+    Backup443,
+};
+
 class AwsIotClient : public IAwsIotClient 
 {
 public:
@@ -20,8 +26,11 @@ public:
 
     bool Initialize() override;
     bool Connect() override;
+    bool ConnectWithProfile(AwsIotConnectionProfile profile, uint32_t timeoutMs);
     void Disconnect() override;
     bool IsConnected() const override;
+    AwsIotConnectionProfile GetConnectionProfile() const { return current_profile; }
+    bool IsBackup443Connection() const { return current_profile == AwsIotConnectionProfile::Backup443; }
 
     bool PublishTelemetry(const LogiSensorData& sensorData) override;
     bool PublishTelemetryAndWait(const LogiSensorData& sensorData);
@@ -56,6 +65,10 @@ private:
 
     bool waitForConnection(uint32_t timeoutMs);
     bool waitForShadowResponse(uint32_t timeoutMs);
+    bool connectToEndpoint(const char* endpoint,
+                           uint16_t port,
+                           uint32_t timeoutMs,
+                           bool useAwsPort443Alpn);
 
     std::string createTelemetryJson(const LogiSensorData& sensorData);
     std::string createTelemetryJsonLogi4Format(const LogiSensorData& sensorData, const TelemetryContext& context);
@@ -66,6 +79,7 @@ private:
 
     esp_mqtt_client_handle_t mqtt_client;
     std::atomic<bool> connected;
+    AwsIotConnectionProfile current_profile = AwsIotConnectionProfile::Primary8883;
 
     SemaphoreHandle_t connection_semaphore;
     SemaphoreHandle_t shadow_semaphore;

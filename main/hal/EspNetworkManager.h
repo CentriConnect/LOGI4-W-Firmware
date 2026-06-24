@@ -53,6 +53,9 @@ class EspNetworkManager : public INetworkManager
     /// </summary>
     static void EventHandler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
+    bool IsStaAssociated() const;
+    bool HasCurrentIp() const;
+
 public:
     /// <summary>
     /// Constructor. Initializes the network manager.

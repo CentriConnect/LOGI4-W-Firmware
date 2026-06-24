@@ -100,7 +100,7 @@ bool TemperatureSensorSht4x::ReadRaw(uint16_t &temperature, uint16_t &humidity)
     err = i2c.Read(buffer, sizeof(buffer));
     if (err != HAL_I2C_OK)
     {
-        SHT4X_LOG_ERR("Read data failed: %d", err);
+        SHT4X_LOG_DBG("Read data failed: %d", err);
         return false;
     }
 

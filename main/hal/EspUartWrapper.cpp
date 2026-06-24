@@ -139,7 +139,7 @@ static void parse_nmea_and_print_lat_lon(const char* nmea_data) {
                     if (*lon_dir == 'W') lon_deg = -lon_deg;
                 }
 
-                printf("Latitude: %.6f, Longitude: %.6f\n", lat_deg, lon_deg);
+                ESP_LOGD("EspUartWrapper", "Latitude: %.6f, Longitude: %.6f", lat_deg, lon_deg);
             }
         }
 
@@ -253,7 +253,7 @@ void EspUartWrapper::uart_event_task(void* pvParameters) {
             }
         } else {
             // Queue receive timed out - no UART events for 5 seconds
-            ESP_LOGW(TAG, "No UART data received in last 5 seconds (total bytes so far: %lu)", total_bytes_received);
+            ESP_LOGD(TAG, "No UART data received in last 5 seconds (total bytes so far: %lu)", total_bytes_received);
         }
     }
     vTaskDelete(NULL);

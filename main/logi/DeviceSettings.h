@@ -20,6 +20,10 @@ public:
     static const size_t DEVICE_ID_BUFFER_SIZE = 37; // UUID string "0000..." length + 1 for null
     static const size_t SW_RESET_STATUS_BUFFER_SIZE = 20;
     static const size_t MQTT_SCHEDULED_POST_BUFFER_SIZE = 16;
+    static const size_t EVENT_THRESHOLDS_BUFFER_SIZE = 128;
+    static constexpr uint32_t DEFAULT_SENSOR_SAMPLE_RATE_MIN = 3;
+    static constexpr uint32_t MIN_SENSOR_SAMPLE_RATE_MIN = 3;
+    static constexpr uint32_t MAX_SENSOR_SAMPLE_RATE_MIN = 1440;
     static const uint16_t DEVICE_ID_VALID_FLAG_VALUE = 0xBAFD;
 // Use the Kconfig value for the defaults applied flag
 // Ensure this is defined in your sdkconfig.h or replace with literal value
@@ -136,6 +140,9 @@ public:
     uint32_t getBleAdvTime() const;
     bool getEventPosts() const;
     bool getMqttScheduledPost(char *buffer, size_t bufferSize) const;
+    bool getEventThresholdsPct(char *buffer, size_t bufferSize) const;
+    uint32_t getMqttTimeout() const;
+    uint32_t getSensorSampleRateMinutes() const;
 
     /**
      * @brief Checks if the stored Device ID is considered valid based on the flag.
@@ -200,6 +207,9 @@ public:
     bool setBleAdvTime(uint32_t milliseconds);
     bool setEventPosts(bool enabled);
     bool setMqttScheduledPost(const char *schedule);
+    bool setEventThresholdsPct(const char *thresholds);
+    bool setMqttTimeout(uint32_t seconds);
+    bool setSensorSampleRateMinutes(uint32_t minutes);
 
 private:
     // --- Private Members ---
@@ -217,6 +227,9 @@ private:
     uint32_t _bleAdvTime;       // REQ-SHADOW: BLE adv interval (ms) for prov mode
     bool _eventPosts;
     char _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE];
+    char _eventThresholdsPct[EVENT_THRESHOLDS_BUFFER_SIZE];
+    uint32_t _mqttTimeout;
+    uint32_t _sensorSampleRateMin;
     uint16_t _deviceIdValidFlag;
     uint16_t _defaultsAppliedFlag;
 
@@ -231,6 +244,9 @@ private:
     static const char *KEY_BLE_ADV_T;       // REQ-SHADOW
     static const char *KEY_EVENT_POSTS;
     static const char *KEY_MQTT_SCHED_POST;
+    static const char *KEY_EVENT_THRESHOLDS;
+    static const char *KEY_MQTT_TIMEOUT;
+    static const char *KEY_SENSOR_SAMPLE_RATE;
     static const char *KEY_DEVICE_ID_VALID;
     static const char *KEY_DEFAULTS_SET;
 
@@ -273,6 +289,7 @@ private:
      */
     bool loadOrDefaultWeeklySchedules();
     bool loadOrDefaultMqttScheduledPost();
+    bool loadOrDefaultEventThresholdsPct();
 
     /**
      * @brief Converts the internal _softwareResetStatusStr to the enum value.

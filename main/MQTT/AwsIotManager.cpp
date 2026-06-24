@@ -41,12 +41,60 @@ bool AwsIotManager::Initialize()
 
 bool AwsIotManager::Connect() 
 {
-    if (!aws_client->Connect()) 
+    return ConnectWithProfile(AwsIotConnectionProfile::Primary8883,
+                              AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S);
+}
+
+bool AwsIotManager::ConnectWithProfile(AwsIotConnectionProfile profile, uint32_t timeoutSeconds)
+{
+    if (timeoutSeconds < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+    {
+        timeoutSeconds = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;
+    }
+
+    AwsIotClient* client = static_cast<AwsIotClient*>(aws_client.get());
+    return client->ConnectWithProfile(profile, timeoutSeconds * 1000UL);
+}
+
+bool AwsIotManager::ConnectWithWaterfall(uint32_t timeoutSeconds)
+{
+    if (timeoutSeconds < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+    {
+        timeoutSeconds = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;
+    }
+
+    ESP_LOGI(TAG, "AWS MQTT waterfall: trying primary 8883 for %lu seconds",
+             static_cast<unsigned long>(timeoutSeconds));
+    if (ConnectWithProfile(AwsIotConnectionProfile::Primary8883, timeoutSeconds))
+    {
+        ESP_LOGI(TAG, "AWS MQTT waterfall connected on primary 8883");
+        return true;
+    }
+
+    Disconnect();
+
+    ESP_LOGW(TAG, "AWS MQTT primary 8883 failed; trying backup 443 for %lu seconds",
+             static_cast<unsigned long>(timeoutSeconds));
+    if (ConnectWithProfile(AwsIotConnectionProfile::Backup443, timeoutSeconds))
+    {
+        ESP_LOGI(TAG, "AWS MQTT waterfall connected on backup 443");
+        return true;
+    }
+
+    Disconnect();
+    ESP_LOGE(TAG, "AWS MQTT waterfall failed on both primary 8883 and backup 443");
+    return false;
+}
+
+bool AwsIotManager::IsConnectedViaBackup443() const
+{
+    if (!aws_client)
     {
         return false;
     }
 
-    return true;
+    const AwsIotClient* client = static_cast<const AwsIotClient*>(aws_client.get());
+    return client->IsBackup443Connection();
 }
 
 void AwsIotManager::Disconnect() 

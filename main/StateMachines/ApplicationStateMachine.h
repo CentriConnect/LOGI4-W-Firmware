@@ -58,6 +58,9 @@ public:
     void removeFirstFromPostQueue();
 
     ILogiHardwareDriver* GetHardwareDriver() { return _logiHardwareDriver.get(); }
+    void recordSensorSampleTime(time_t sampleTime);
+
+    bool checkAndConnectWifi();
 
     // Update weekly schedules from shadow state and persist to NVS
     bool updateSchedulesFromShadow(const DeviceShadowState& shadowState);
@@ -104,6 +107,7 @@ private:
     uint8_t loadLastFuelLevel();
     void saveLastFuelLevel(uint8_t level);
     uint64_t calculateSleepDuration();
+    uint64_t calculateSleepDurationFrom(time_t now);
 
     // ApplicationStateMachine state functions
     void ApplicationStateWake();
@@ -116,7 +120,6 @@ private:
 
     // Provisioning helpers
     void enterProvisioningMode(ProvisioningMode mode);
-    bool checkAndConnectWifi();
     bool checkForceProvisioningFlag();
 };
 

@@ -1,6 +1,7 @@
 #include "DeviceSettings.h"
 #include <string.h> // For memcpy, strcpy, strncpy, strcmp
 #include "esp_log.h"
+#include "MQTT/AwsIotConfig.h"
 
 // --- Static Member Definitions ---
 const char *DeviceSettings::TAG = "DeviceSettings";
@@ -16,6 +17,9 @@ const char *DeviceSettings::KEY_POST_DWELL_T = "PostDwellT";
 const char *DeviceSettings::KEY_BLE_ADV_T    = "BleAdvT";       // REQ-SHADOW: BLE adv interval (ms)
 const char *DeviceSettings::KEY_EVENT_POSTS = "EventPosts";
 const char *DeviceSettings::KEY_MQTT_SCHED_POST = "MqttSched";
+const char *DeviceSettings::KEY_EVENT_THRESHOLDS = "EvtThresh";
+const char *DeviceSettings::KEY_MQTT_TIMEOUT = "MqttTimeout";
+const char *DeviceSettings::KEY_SENSOR_SAMPLE_RATE = "SampleRate";
 const char *DeviceSettings::KEY_DEVICE_ID_VALID = "DeviceIdValid";
 const char *DeviceSettings::KEY_DEFAULTS_SET = "DefaultsSet";
 
@@ -34,6 +38,8 @@ DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsSer
                                                                     _postDwellTime(0),
                                                                     _bleAdvTime(0),
                                                                     _eventPosts(false),
+                                                                    _mqttTimeout(AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S),
+                                                                    _sensorSampleRateMin(DEFAULT_SENSOR_SAMPLE_RATE_MIN),
 
                                                                     _deviceIdValidFlag(0),
                                                                     _defaultsAppliedFlag(0)
@@ -43,6 +49,7 @@ DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsSer
     memset(_deviceId, 0, sizeof(_deviceId));
     memset(_softwareResetStatusStr, 0, sizeof(_softwareResetStatusStr));
     memset(_mqttScheduledPost, 0, sizeof(_mqttScheduledPost));
+    memset(_eventThresholdsPct, 0, sizeof(_eventThresholdsPct));
     memset(_weeklySchedules, 0, sizeof(_weeklySchedules));
 }
 
@@ -97,6 +104,9 @@ bool DeviceSettings::Initialize()
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_BLE_ADV_T, _bleAdvTime, CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS);
     success &= loadOrDefaultBasicTypeSetting<bool>(KEY_EVENT_POSTS, _eventPosts, false);
     success &= loadOrDefaultMqttScheduledPost();
+    success &= loadOrDefaultEventThresholdsPct();
+    success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_MQTT_TIMEOUT, _mqttTimeout, AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S);
+    success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_SENSOR_SAMPLE_RATE, _sensorSampleRateMin, DEFAULT_SENSOR_SAMPLE_RATE_MIN);
     success &= loadOrDefaultBasicTypeSetting<uint16_t>(KEY_DEVICE_ID_VALID, _deviceIdValidFlag, 0); // Default DeviceId is not valid
 
     if (!success)
@@ -170,6 +180,9 @@ bool DeviceSettings::ApplyDefaults()
     _bleAdvTime = CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS;
     _eventPosts = false;
     _mqttScheduledPost[0] = '\0';
+    _eventThresholdsPct[0] = '\0';
+    _mqttTimeout = AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S;
+    _sensorSampleRateMin = DEFAULT_SENSOR_SAMPLE_RATE_MIN;
 
     // Default Weekly Schedule
     memset(_weeklySchedules, 0, sizeof(_weeklySchedules));
@@ -194,6 +207,9 @@ bool DeviceSettings::ApplyDefaults()
     success &= _settingsService.SetValue(KEY_BLE_ADV_T, reinterpret_cast<const uint8_t *>(&_bleAdvTime), sizeof(_bleAdvTime));
     success &= _settingsService.SetValue(KEY_EVENT_POSTS, _eventPosts);
     success &= _settingsService.SetValue(KEY_MQTT_SCHED_POST, reinterpret_cast<const uint8_t *>(_mqttScheduledPost), strlen(_mqttScheduledPost) + 1);
+    success &= _settingsService.SetValue(KEY_EVENT_THRESHOLDS, reinterpret_cast<const uint8_t *>(_eventThresholdsPct), strlen(_eventThresholdsPct) + 1);
+    success &= _settingsService.SetValue(KEY_MQTT_TIMEOUT, reinterpret_cast<const uint8_t *>(&_mqttTimeout), sizeof(_mqttTimeout));
+    success &= _settingsService.SetValue(KEY_SENSOR_SAMPLE_RATE, reinterpret_cast<const uint8_t *>(&_sensorSampleRateMin), sizeof(_sensorSampleRateMin));
     success &= _settingsService.SetValue(KEY_DEFAULTS_SET, reinterpret_cast<const uint8_t *>(&_defaultsAppliedFlag), sizeof(_defaultsAppliedFlag));
     // --- End Save ---
 
@@ -364,6 +380,20 @@ bool DeviceSettings::loadOrDefaultMqttScheduledPost()
     return _settingsService.SetValue(KEY_MQTT_SCHED_POST, reinterpret_cast<const uint8_t *>(_mqttScheduledPost), strlen(_mqttScheduledPost) + 1);
 }
 
+bool DeviceSettings::loadOrDefaultEventThresholdsPct()
+{
+    size_t actual_size = _settingsService.GetValue(KEY_EVENT_THRESHOLDS, reinterpret_cast<uint8_t *>(_eventThresholdsPct), EVENT_THRESHOLDS_BUFFER_SIZE);
+    if (actual_size > 0 && actual_size <= EVENT_THRESHOLDS_BUFFER_SIZE)
+    {
+        _eventThresholdsPct[EVENT_THRESHOLDS_BUFFER_SIZE - 1] = '\0';
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Setting '%s' not found in NVS. Applying default.", KEY_EVENT_THRESHOLDS);
+    _eventThresholdsPct[0] = '\0';
+    return _settingsService.SetValue(KEY_EVENT_THRESHOLDS, reinterpret_cast<const uint8_t *>(_eventThresholdsPct), strlen(_eventThresholdsPct) + 1);
+}
+
 // --- Getters ---
 
 bool DeviceSettings::getDeviceId(char *buffer, size_t bufferSize) const
@@ -458,6 +488,39 @@ bool DeviceSettings::getMqttScheduledPost(char *buffer, size_t bufferSize) const
     strncpy(buffer, _mqttScheduledPost, bufferSize);
     buffer[bufferSize - 1] = '\0';
     return true;
+}
+
+bool DeviceSettings::getEventThresholdsPct(char *buffer, size_t bufferSize) const
+{
+    if (!_initialized || buffer == nullptr || bufferSize == 0)
+        return false;
+
+    strncpy(buffer, _eventThresholdsPct, bufferSize);
+    buffer[bufferSize - 1] = '\0';
+    return true;
+}
+
+uint32_t DeviceSettings::getMqttTimeout() const
+{
+    if (!_initialized)
+        return AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S;
+    return (_mqttTimeout < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+        ? AWS_IOT_MIN_WATERFALL_TIMEOUT_S
+        : _mqttTimeout;
+}
+
+uint32_t DeviceSettings::getSensorSampleRateMinutes() const
+{
+    if (!_initialized)
+        return DEFAULT_SENSOR_SAMPLE_RATE_MIN;
+
+    if (_sensorSampleRateMin < MIN_SENSOR_SAMPLE_RATE_MIN ||
+        _sensorSampleRateMin > MAX_SENSOR_SAMPLE_RATE_MIN)
+    {
+        return DEFAULT_SENSOR_SAMPLE_RATE_MIN;
+    }
+
+    return _sensorSampleRateMin;
 }
 
 bool DeviceSettings::isDeviceIdValid() const
@@ -665,6 +728,71 @@ bool DeviceSettings::setMqttScheduledPost(const char *schedule)
                                              strlen(_mqttScheduledPost) + 1);
     if (!success)
         ESP_LOGE(TAG, "Failed to save mqtt_scheduled_post!");
+    return success;
+}
+
+bool DeviceSettings::setEventThresholdsPct(const char *thresholds)
+{
+    if (!_initialized)
+        return false;
+    if (thresholds == nullptr)
+        thresholds = "";
+
+    ESP_LOGI(TAG, "Setting event_thresholds_pct to: %s", thresholds);
+    strncpy(_eventThresholdsPct, thresholds, EVENT_THRESHOLDS_BUFFER_SIZE - 1);
+    _eventThresholdsPct[EVENT_THRESHOLDS_BUFFER_SIZE - 1] = '\0';
+
+    bool success = _settingsService.SetValue(KEY_EVENT_THRESHOLDS,
+                                             reinterpret_cast<const uint8_t *>(_eventThresholdsPct),
+                                             strlen(_eventThresholdsPct) + 1);
+    if (!success)
+        ESP_LOGE(TAG, "Failed to save event_thresholds_pct!");
+    return success;
+}
+
+bool DeviceSettings::setMqttTimeout(uint32_t seconds)
+{
+    if (!_initialized)
+        return false;
+
+    if (seconds < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+    {
+        ESP_LOGW(TAG, "mqtt_timeout %lu below min %d; clamping to min",
+                 seconds,
+                 AWS_IOT_MIN_WATERFALL_TIMEOUT_S);
+        seconds = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;
+    }
+
+    ESP_LOGI(TAG, "Setting mqtt_timeout to: %lu seconds", seconds);
+    _mqttTimeout = seconds;
+    bool success = _settingsService.SetValue(KEY_MQTT_TIMEOUT,
+                                             reinterpret_cast<const uint8_t *>(&_mqttTimeout),
+                                             sizeof(_mqttTimeout));
+    if (!success)
+        ESP_LOGE(TAG, "Failed to save mqtt_timeout!");
+    return success;
+}
+
+bool DeviceSettings::setSensorSampleRateMinutes(uint32_t minutes)
+{
+    if (!_initialized)
+        return false;
+
+    if (minutes < MIN_SENSOR_SAMPLE_RATE_MIN || minutes > MAX_SENSOR_SAMPLE_RATE_MIN)
+    {
+        ESP_LOGW(TAG, "sensor_sample_rate %lu invalid; using default %lu minutes",
+                 static_cast<unsigned long>(minutes),
+                 static_cast<unsigned long>(DEFAULT_SENSOR_SAMPLE_RATE_MIN));
+        minutes = DEFAULT_SENSOR_SAMPLE_RATE_MIN;
+    }
+
+    ESP_LOGI(TAG, "Setting sensor_sample_rate to: %lu minutes", static_cast<unsigned long>(minutes));
+    _sensorSampleRateMin = minutes;
+    bool success = _settingsService.SetValue(KEY_SENSOR_SAMPLE_RATE,
+                                             reinterpret_cast<const uint8_t *>(&_sensorSampleRateMin),
+                                             sizeof(_sensorSampleRateMin));
+    if (!success)
+        ESP_LOGE(TAG, "Failed to save sensor_sample_rate!");
     return success;
 }
 

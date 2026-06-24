@@ -28,6 +28,9 @@ public:
     static constexpr int64_t SUCCESS_DISPLAY_MS =
         static_cast<int64_t>(CONFIG_LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN) * 60LL * 1000LL;
 
+    static constexpr int64_t ACTIVATION_GPS_TIMEOUT_MS =
+        (SUCCESS_DISPLAY_MS * 9LL) / 10LL;
+
     // ISS-FW-020 deadman: no TRANSIENT state (anything except Advertising and
     // SuccessDisplay, which have their own bounded exits) may last this long.
     // A state older than this means a lost event / wedged handshake - reboot
@@ -91,11 +94,11 @@ private:
     // stays non-blocking.
     uint8_t _firstBootSubStep = 0;
 
-    // V13-010: sensor snapshot sampled at the [1/4] ack post and REUSED by the
-    // [4/4] confirm post, so the activation never runs two back-to-back
-    // measurements (the 2nd fuel read fails -> ful/raw/supv zeros).
+    // Activation sensor snapshot. Sampled for the initial ack post, then
+    // refreshed once more immediately before the final post after the GPS wait.
     LogiSensorData _firstBootSensorSnapshot{};
     int64_t _firstBootStepStartMs = 0;
+    int64_t _firstBootGpsStartMs = 0;
 
     EspNvsStorage* _nvsStorage;
     EspBluetoothManager* _bleManager;
@@ -128,6 +131,7 @@ private:
     esp_err_t getDeviceServiceName(char* serviceName, size_t maxLen);
     esp_err_t getDevicePop(char* pop, size_t maxLen);
     bool publishFirstBootTelemetry(AwsIotClient* client);
+    bool publishFirstBootUdpTelemetry();
     void populateFirstBootTelemetryContext(TelemetryContext& context, const LogiSensorData& data) const;
 
     esp_err_t backupCurrentCredentials();

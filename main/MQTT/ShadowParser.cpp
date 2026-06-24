@@ -1,5 +1,6 @@
 #include "DeviceShadowState.h"
 #include "ShadowParser.h"
+#include "AwsIotConfig.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include <string>
@@ -17,6 +18,10 @@ static constexpr uint32_t MIN_WIFI_TIMEOUT_S      = 300;
 static constexpr uint8_t  MIN_FILL_ALARM_DELTA    = 10;
 static constexpr uint32_t MIN_POST_DWELL_TIME_S   = 60;
 static constexpr uint32_t MIN_BLE_ADV_TIME_MS     = 1;
+static constexpr uint32_t MIN_MQTT_TIMEOUT_S      = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;
+static constexpr uint32_t DEFAULT_SENSOR_SAMPLE_RATE_MIN = 3;
+static constexpr uint32_t MIN_SENSOR_SAMPLE_RATE_MIN = 3;
+static constexpr uint32_t MAX_SENSOR_SAMPLE_RATE_MIN = 1440;
 
 static std::string trimCopy(const std::string& value)
 {
@@ -173,7 +178,14 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
 
         item = cJSON_GetObjectItem(config, "sensor_sample_rate");
         if (item && cJSON_IsNumber(item)) {
-            stateOut.sensor_sample_rate = (uint32_t)item->valueint;
+            uint32_t v = (uint32_t)item->valueint;
+            if (v < MIN_SENSOR_SAMPLE_RATE_MIN || v > MAX_SENSOR_SAMPLE_RATE_MIN) {
+                ESP_LOGW(TAG, "sensor_sample_rate %u invalid; using default %u",
+                         (unsigned)v,
+                         (unsigned)DEFAULT_SENSOR_SAMPLE_RATE_MIN);
+                v = DEFAULT_SENSOR_SAMPLE_RATE_MIN;
+            }
+            stateOut.sensor_sample_rate = v;
             success = true;
         }
 
@@ -186,7 +198,12 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
 
         item = cJSON_GetObjectItem(config, "mqtt_timeout");
         if (item && cJSON_IsNumber(item)) {
-            stateOut.mqtt_timeout = (uint32_t)item->valueint;
+            uint32_t v = (uint32_t)item->valueint;
+            if (v < MIN_MQTT_TIMEOUT_S) {
+                ESP_LOGW(TAG, "mqtt_timeout %u below min %u; clamping", (unsigned)v, (unsigned)MIN_MQTT_TIMEOUT_S);
+                v = MIN_MQTT_TIMEOUT_S;
+            }
+            stateOut.mqtt_timeout = v;
             success = true;
         }
 
@@ -216,10 +233,7 @@ std::string CreateEnhancedShadowUpdate(const DeviceShadowState& state, const Log
 
     // 2. Configuration values
     cJSON_AddNumberToObject(reported, "fill_dwell_time", state.fill_dwell_time);
-    // REV B renames lte_timeout -> wifi_timeout. Report under both keys until the
-    // cellular-schema cutover is complete so both parsers can read the value.
     cJSON_AddNumberToObject(reported, "wifi_timeout", state.lte_timeout);
-    cJSON_AddNumberToObject(reported, "lte_timeout", state.lte_timeout);
     cJSON_AddNumberToObject(reported, "fill_alarm_delta", state.fill_alarm_delta);
     cJSON_AddNumberToObject(reported, "post_dwell_time", state.post_dwell_time);
     cJSON_AddNumberToObject(reported, "ble_adv_time", state.ble_adv_time);

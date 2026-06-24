@@ -20,35 +20,77 @@ static constexpr uint8_t AUTH_FAILURE_THRESHOLD = 10;
 #include "PostingStateMachine.h"
 #include "logi/EspLogiHardwareFactory.h"
 #include "logi/ResetCounter.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 
 static const char *TAG = "ApplicationStateMachine";
 static const char *NVS_LAST_FUEL_KEY = "lastFuelLvl";
 
-static const uint64_t MINUTE_INTERVAL_US = 60 * 1000 * 1000ULL; 
+static const uint64_t SECOND_INTERVAL_US = 1000 * 1000ULL;
 static const uint64_t SLEEP_OFFSET_US = 100 * 1000ULL;
+static constexpr uint32_t MAX_SLEEP_MINUTES = DeviceSettings::MAX_SENSOR_SAMPLE_RATE_MIN;
+RTC_DATA_ATTR static int64_t s_lastSensorSampleTime = 0;
 
-static uint64_t microseconds_to_next_minute(time_t now)
+static bool parseScheduleString(const char* schedule, int& hour, int& minute, uint8_t& daysOfWeek)
 {
-    if (now == 0)
+    if (schedule == nullptr || schedule[0] == '\0')
     {
-        ESP_LOGW(TAG, "Time not synced, sleeping for default minute interval.");
-        return MINUTE_INTERVAL_US; // Sleep for a full minute if time is unknown
+        return false;
     }
-    
-    uint32_t seconds_past_minute = now % 60;
-    uint64_t sleep_s = (60 - seconds_past_minute);
-    
-    // Ensure we don't sleep for 0 seconds if we are exactly on the minute
-    if (sleep_s == 0)
+
+    unsigned int dayByte = 0;
+    if (sscanf(schedule, "%d:%d;%x", &hour, &minute, &dayByte) != 3)
     {
-        sleep_s = 60;
+        return false;
     }
-    
-    uint64_t sleep_us = sleep_s * 1000 * 1000ULL + SLEEP_OFFSET_US;
-    ESP_LOGD(TAG, "Calculating sleep: now=%ld, secs_past_min=%lu, sleep_s=%llu, sleep_us=%llu",
-             (long)now, seconds_past_minute, sleep_s, sleep_us);
-             
-    return sleep_us;
+
+    if (!(dayByte & 0x80) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    {
+        return false;
+    }
+
+    daysOfWeek = static_cast<uint8_t>(dayByte & 0x7F);
+    return daysOfWeek != 0;
+}
+
+static int64_t secondsUntilWeeklyTime(time_t now, int hour, int minute, uint8_t daysOfWeek)
+{
+    struct tm timeInfo{};
+    if (now <= 0 || localtime_r(&now, &timeInfo) == nullptr)
+    {
+        return -1;
+    }
+
+    const int currentWday = timeInfo.tm_wday;
+    const int currentSecondsOfDay = (timeInfo.tm_hour * 3600) + (timeInfo.tm_min * 60) + timeInfo.tm_sec;
+    const int scheduledSecondsOfDay = (hour * 3600) + (minute * 60);
+
+    int64_t best = -1;
+    for (int dayOffset = 0; dayOffset < 7; ++dayOffset)
+    {
+        int candidateWday = (currentWday + dayOffset) % 7;
+        if (!(daysOfWeek & (1 << candidateWday)))
+        {
+            continue;
+        }
+
+        int64_t delta = static_cast<int64_t>(dayOffset) * 86400LL +
+                        scheduledSecondsOfDay -
+                        currentSecondsOfDay;
+        if (delta <= 0)
+        {
+            delta += 7LL * 86400LL;
+        }
+
+        if (best < 0 || delta < best)
+        {
+            best = delta;
+        }
+    }
+
+    return best;
 }
 
 ApplicationStateMachine::ApplicationStateMachine() :
@@ -178,7 +220,7 @@ bool ApplicationStateMachine::init()
     _dataSampleStateMachine = std::make_unique<DataSampleStateMachine>(_logiHardwareDriver.get(), _currentSensorData, &_timeKeeper);
     _checkFillDetectStateMachine = std::make_unique<CheckFillDetectStateMachine>(&_timeKeeper, _deviceSettings, _currentSensorData);
     _scheduleCheckStateMachine = std::make_unique<ScheduleCheckStateMachine>(&_timeKeeper, _deviceSettings, _networkManager.get(), _currentSensorData);
-    _postingStateMachine = std::make_unique<PostingStateMachine>(&_awsIotManager, &_timeKeeper, _currentSensorData, _deviceSettings);
+    _postingStateMachine = std::make_unique<PostingStateMachine>(&_awsIotManager, &_timeKeeper, _logiHardwareDriver.get(), _currentSensorData, _deviceSettings);
 
     // Set parent pointers for communication
     _wakeStateMachine->setParentStateMachine(this);
@@ -190,7 +232,6 @@ bool ApplicationStateMachine::init()
 
     // Check for stored WiFi credentials
     bool hasCredentials = _provisioningStateMachine->hasStoredCredentials();
-    bool connect_success = false;
 
 #ifdef CONFIG_LOGI_DEBUG_USE_HARDCODED_WIFI
     if (!hasCredentials) {
@@ -200,63 +241,6 @@ bool ApplicationStateMachine::init()
     }
 #endif
 
-    if (hasCredentials) {
-        // Load credentials from NVS and try to connect
-        char ssid[33] = {0};
-        char password[65] = {0};
-
-        if (_settingsStorage.LoadString(ProvisioningStateMachine::NVS_WIFI_SSID_KEY, ssid, sizeof(ssid)) &&
-            _settingsStorage.LoadString(ProvisioningStateMachine::NVS_WIFI_PASS_KEY, password, sizeof(password))) {
-
-            ESP_LOGI(TAG, "Connecting to Wi-Fi (SSID: %s)...", ssid);
-            connect_success = _networkManager->Connect(ssid, password);
-        }
-    } else {
-        ESP_LOGW(TAG, "No stored WiFi credentials found");
-    }
-
-    if (connect_success) {
-        ESP_LOGI(TAG, "Wi-Fi Connected.");
-        // Reset auth failure counter on successful connection
-        s_authFailureCount = 0;
-    } else {
-        ESP_LOGW(TAG, "Wi-Fi Not Connected.");
-
-        // Check failure type and handle re-provisioning triggers
-        if (hasCredentials) {
-            WifiFailureType failureType = _networkManager->GetLastFailureType();
-
-            switch (failureType) {
-                case WifiFailureType::WifiFailure_AuthError:
-                    s_authFailureCount++;
-                    ESP_LOGW(TAG, "Auth failure count: %d/%d", s_authFailureCount, AUTH_FAILURE_THRESHOLD);
-                    if (s_authFailureCount >= AUTH_FAILURE_THRESHOLD) {
-                        ESP_LOGW(TAG, "Auth failure threshold reached - entering re-provisioning mode");
-                        s_authFailureCount = 0;
-                        _provisioningStateMachine->init(ProvisioningMode::ReProvision);
-                        currentState = ApplicationState::ApplicationState_Provisioning;
-                    }
-                    break;
-
-                case WifiFailureType::WifiFailure_ApNotFound:
-                    ESP_LOGW(TAG, "AP not found - SSID may have changed, entering re-provisioning mode");
-                    s_authFailureCount = 0;
-                    _provisioningStateMachine->init(ProvisioningMode::ReProvision);
-                    currentState = ApplicationState::ApplicationState_Provisioning;
-                    break;
-
-                case WifiFailureType::WifiFailure_Timeout:
-                    // Connection timeout - do NOT trigger re-provisioning, just log
-                    ESP_LOGW(TAG, "Connection timeout - will retry on next wake");
-                    break;
-
-                default:
-                    ESP_LOGW(TAG, "Unknown WiFi failure type");
-                    break;
-            }
-        }
-    }
-
     WakeupReason wakeup_reason = _powerManager->GetWakeupReason();
     if (wakeup_reason == WAKEUP_REASON_RESET)
     {
@@ -265,6 +249,8 @@ bool ApplicationStateMachine::init()
             ESP_LOGI(TAG, "First boot without credentials - entering provisioning mode");
             _provisioningStateMachine->init(ProvisioningMode::FirstBoot);
             currentState = ApplicationState::ApplicationState_Provisioning;
+        } else {
+            ESP_LOGI(TAG, "Stored Wi-Fi credentials found; deferring Wi-Fi connection until a post is due");
         }
     }
 
@@ -388,6 +374,15 @@ void ApplicationStateMachine::removeFirstFromPostQueue()
     ESP_LOGI(TAG, "Removed sensor data from post queue. Count: %d", _postQueueCount);
 }
 
+void ApplicationStateMachine::recordSensorSampleTime(time_t sampleTime)
+{
+    if (sampleTime > 0)
+    {
+        s_lastSensorSampleTime = static_cast<int64_t>(sampleTime);
+        ESP_LOGD(TAG, "Recorded sensor sample time: %lld", s_lastSensorSampleTime);
+    }
+}
+
 void ApplicationStateMachine::ApplicationStateWake()
 {
     _wakeStateMachine->update();
@@ -461,10 +456,36 @@ bool ApplicationStateMachine::checkAndConnectWifi()
 
         if (connected) {
             ESP_LOGI(TAG, "WiFi connected successfully");
+            s_authFailureCount = 0;
             return true;
         } else {
             ESP_LOGW(TAG, "WiFi connection failed");
-            // TODO: Track failure type and count for re-provisioning logic
+            WifiFailureType failureType = _networkManager->GetLastFailureType();
+            switch (failureType) {
+                case WifiFailureType::WifiFailure_AuthError:
+                    s_authFailureCount++;
+                    ESP_LOGW(TAG, "Auth failure count: %d/%d", s_authFailureCount, AUTH_FAILURE_THRESHOLD);
+                    if (s_authFailureCount >= AUTH_FAILURE_THRESHOLD) {
+                        ESP_LOGW(TAG, "Auth failure threshold reached - entering re-provisioning mode");
+                        s_authFailureCount = 0;
+                        enterProvisioningMode(ProvisioningMode::ReProvision);
+                    }
+                    break;
+
+                case WifiFailureType::WifiFailure_ApNotFound:
+                    ESP_LOGW(TAG, "AP not found - SSID may have changed, entering re-provisioning mode");
+                    s_authFailureCount = 0;
+                    enterProvisioningMode(ProvisioningMode::ReProvision);
+                    break;
+
+                case WifiFailureType::WifiFailure_Timeout:
+                    ESP_LOGW(TAG, "Connection timeout - will retry on next scheduled post");
+                    break;
+
+                default:
+                    ESP_LOGW(TAG, "Unknown WiFi failure type");
+                    break;
+            }
             return false;
         }
     }
@@ -509,7 +530,7 @@ void ApplicationStateMachine::ApplicationStatePosting()
 void ApplicationStateMachine::ApplicationStateSleep()
 {
     time_t current_time = _timeKeeper.GetCurrentTime();
-    uint64_t sleep_duration_us = microseconds_to_next_minute(current_time);
+    uint64_t sleep_duration_us = calculateSleepDurationFrom(current_time);
 
     ESP_LOGI(TAG, "All tasks complete. Entering deep sleep for %llu us...", sleep_duration_us);
 
@@ -532,6 +553,117 @@ void ApplicationStateMachine::ApplicationStateSleep()
     _powerManager->Sleep(sleep_duration_us);
 
     ESP_LOGE(TAG, "!!! Critical Error: Exited Sleep call unexpectedly !!!");
+}
+
+uint64_t ApplicationStateMachine::calculateSleepDuration()
+{
+    return calculateSleepDurationFrom(_timeKeeper.GetCurrentTime());
+}
+
+uint64_t ApplicationStateMachine::calculateSleepDurationFrom(time_t now)
+{
+    const uint32_t sampleRateMin = _deviceSettings.getSensorSampleRateMinutes();
+    int64_t sleepSeconds = static_cast<int64_t>(sampleRateMin) * 60LL;
+
+    if (now > 0 && s_lastSensorSampleTime > 0)
+    {
+        int64_t nextSample = s_lastSensorSampleTime + sleepSeconds;
+        int64_t untilSample = nextSample - static_cast<int64_t>(now);
+        if (untilSample <= 0)
+        {
+            untilSample = 1;
+        }
+        sleepSeconds = untilSample;
+    }
+
+    const bool fillDwellActive = _checkFillDetectStateMachine && _checkFillDetectStateMachine->isInDwell();
+    if (fillDwellActive)
+    {
+        const int64_t dwellDeadline = _checkFillDetectStateMachine->getDwellDeadline();
+        if (now > 0 && dwellDeadline > 0)
+        {
+            int64_t untilDwellDeadline = dwellDeadline - static_cast<int64_t>(now);
+            if (untilDwellDeadline <= 0)
+            {
+                untilDwellDeadline = 1;
+            }
+            sleepSeconds = std::min(sleepSeconds, untilDwellDeadline);
+        }
+
+        ESP_LOGI(TAG, "Sleep plan: fill dwell active, sleeping %lld seconds (sample_rate=%lu min)",
+                 sleepSeconds,
+                 static_cast<unsigned long>(sampleRateMin));
+        return static_cast<uint64_t>(sleepSeconds) * SECOND_INTERVAL_US + SLEEP_OFFSET_US;
+    }
+
+    if (now > 0 && _timeKeeper.IsTimeSynced())
+    {
+        int64_t nextScheduledPostSeconds = -1;
+
+        WeeklySchedule schedules[DeviceSettings::MAX_WEEKLY_SCHEDULES];
+        if (_deviceSettings.getWeeklySchedules(schedules))
+        {
+            for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES; ++i)
+            {
+                if (schedules[i].DaysOfWeek == 0)
+                {
+                    continue;
+                }
+
+                int64_t delta = secondsUntilWeeklyTime(now,
+                                                       schedules[i].StartTime.Hour,
+                                                       schedules[i].StartTime.Minute,
+                                                       schedules[i].DaysOfWeek);
+                if (delta > 0 && (nextScheduledPostSeconds < 0 || delta < nextScheduledPostSeconds))
+                {
+                    nextScheduledPostSeconds = delta;
+                }
+            }
+        }
+
+        char mqttSchedule[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+        int mqttHour = 0;
+        int mqttMinute = 0;
+        uint8_t mqttDays = 0;
+        if (_deviceSettings.getMqttScheduledPost(mqttSchedule, sizeof(mqttSchedule)) &&
+            parseScheduleString(mqttSchedule, mqttHour, mqttMinute, mqttDays))
+        {
+            const uint8_t allDaysMask = 0x7F;
+            uint8_t derivedUdpDays = static_cast<uint8_t>((~mqttDays) & allDaysMask);
+            uint8_t mqttSplitScheduleDays = static_cast<uint8_t>((mqttDays | derivedUdpDays) & allDaysMask);
+            int64_t delta = secondsUntilWeeklyTime(now, mqttHour, mqttMinute, mqttSplitScheduleDays);
+            if (delta > 0 && (nextScheduledPostSeconds < 0 || delta < nextScheduledPostSeconds))
+            {
+                nextScheduledPostSeconds = delta;
+            }
+        }
+
+        if (nextScheduledPostSeconds > 0)
+        {
+            sleepSeconds = std::min(sleepSeconds, nextScheduledPostSeconds);
+        }
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Time not synced; using sensor_sample_rate sleep only (%lu minutes)",
+                 static_cast<unsigned long>(sampleRateMin));
+    }
+
+    const int64_t maxSleepSeconds = static_cast<int64_t>(MAX_SLEEP_MINUTES) * 60LL;
+    if (sleepSeconds > maxSleepSeconds)
+    {
+        sleepSeconds = maxSleepSeconds;
+    }
+    if (sleepSeconds <= 0)
+    {
+        sleepSeconds = 1;
+    }
+
+    ESP_LOGI(TAG, "Sleep plan: sleeping %lld seconds (sample_rate=%lu min)",
+             sleepSeconds,
+             static_cast<unsigned long>(sampleRateMin));
+
+    return static_cast<uint64_t>(sleepSeconds) * SECOND_INTERVAL_US + SLEEP_OFFSET_US;
 }
 
 bool ApplicationStateMachine::updateSchedulesFromShadow(const DeviceShadowState& shadowState)

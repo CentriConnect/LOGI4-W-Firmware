@@ -6,6 +6,7 @@
 #include "AwsIotJobsHandler.h"
 #include "EspTimeKeeper.h"
 #include "LogiSensorData.h"
+#include "ILogiHardwareDriver.h"
 #include "logi/DeviceSettings.h"
 #include <memory>
 #include <optional>
@@ -19,6 +20,7 @@ class PostingStateMachine
 {
 public:
     PostingStateMachine(AwsIotManager* awsIotManager, EspTimeKeeper* timeKeeper,
+                        ILogiHardwareDriver* driver,
                         LogiSensorData& sensorData, DeviceSettings& deviceSettings);
 
     void update();    
@@ -32,6 +34,7 @@ private:
 
     AwsIotManager* _awsIotManager;
     EspTimeKeeper* _timeKeeper;
+    ILogiHardwareDriver* _driver;
     LogiSensorData& _sensorData;
     DeviceSettings& _deviceSettings;
 
@@ -52,6 +55,7 @@ private:
 
     // Gets the connection timeout in seconds (from shadow config, internally renamed from lte_timeout)
     uint32_t getConnectionTimeoutSeconds() const;
+    uint32_t getMqttWaterfallTimeoutSeconds() const;
 
     // Gets the post dwell time in seconds (from shadow config)
     uint32_t getPostDwellTimeSeconds() const;
@@ -60,6 +64,7 @@ private:
     void populateTelemetryContext(TelemetryContext& context) const;
     bool publishTelemetrySnapshot(const LogiSensorData& data, const char* label);
     bool publishUdpTelemetrySnapshot(const LogiSensorData& data, const char* label);
+    bool acquireGpsForMqttPost(LogiSensorData& data);
     void applyShadowSettingsToMemory(const DeviceShadowState& shadowState);
     DeviceShadowState buildReportedShadowFromSettings(const DeviceShadowState& parsedShadowState) const;
 

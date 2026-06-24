@@ -146,21 +146,57 @@ bool AwsIotClient::Initialize()
 
 bool AwsIotClient::Connect() 
 {
+    return ConnectWithProfile(AwsIotConnectionProfile::Primary8883,
+                              AWS_IOT_MQTT_COMMAND_TIMEOUT_MS * 2);
+}
+
+bool AwsIotClient::ConnectWithProfile(AwsIotConnectionProfile profile, uint32_t timeoutMs)
+{
+    if (profile == AwsIotConnectionProfile::Backup443)
+    {
+        return connectToEndpoint(AWS_IOT_BACKUP_ENDPOINT, AWS_IOT_BACKUP_PORT, timeoutMs, true);
+    }
+
+    return connectToEndpoint(AWS_IOT_ENDPOINT, AWS_IOT_PORT, timeoutMs, false);
+}
+
+bool AwsIotClient::connectToEndpoint(const char* endpoint,
+                                     uint16_t port,
+                                     uint32_t timeoutMs,
+                                     bool useAwsPort443Alpn)
+{
     if (connected) 
     {
         ESP_LOGW(TAG, "Already connected");
         return true;
     }
+
+    if (mqtt_client)
+    {
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = nullptr;
+    }
     
-    ESP_LOGI(TAG, "Endpoint: %s:%d", AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    ESP_LOGI(TAG, "Endpoint: %s:%u%s",
+             endpoint,
+             static_cast<unsigned>(port),
+             useAwsPort443Alpn ? " (ALPN x-amzn-mqtt-ca)" : "");
     ESP_LOGI(TAG, "Client ID: %s", AWS_IOT_CLIENT_ID);
+
+    xSemaphoreTake(connection_semaphore, 0);
     
     esp_mqtt_client_config_t mqtt_cfg = {};
     
     // Build the full URI
     char uri[256];
-    snprintf(uri, sizeof(uri), "mqtts://%s:%d", AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    snprintf(uri, sizeof(uri), "mqtts://%s:%u", endpoint, static_cast<unsigned>(port));
     mqtt_cfg.broker.address.uri = uri;
+
+    static const char* awsPort443Alpn[] = { AWS_IOT_PORT443_ALPN, nullptr };
+    if (useAwsPort443Alpn)
+    {
+        mqtt_cfg.broker.verification.alpn_protos = awsPort443Alpn;
+    }
     
     // Set certificates - don't set lengths, let MQTT client handle it
     mqtt_cfg.broker.verification.certificate = aws_root_ca_pem;
@@ -198,7 +234,7 @@ bool AwsIotClient::Connect()
     }
     
     // Wait for connection
-    if (!waitForConnection(AWS_IOT_MQTT_COMMAND_TIMEOUT_MS * 2)) 
+    if (!waitForConnection(timeoutMs)) 
     {
         ESP_LOGE(TAG, "Connection timeout");
         esp_mqtt_client_stop(mqtt_client);
@@ -208,16 +244,22 @@ bool AwsIotClient::Connect()
     }
     
     ESP_LOGI(TAG, "Successfully connected to AWS IoT");
+    current_profile = useAwsPort443Alpn ? AwsIotConnectionProfile::Backup443 : AwsIotConnectionProfile::Primary8883;
     return true;
 }
 
 void AwsIotClient::Disconnect() 
 {
-    if (mqtt_client && connected) 
+    if (mqtt_client) 
     {
-        ESP_LOGI(TAG, "Disconnecting from AWS IoT...");
-        esp_mqtt_client_disconnect(mqtt_client);
+        if (connected)
+        {
+            ESP_LOGI(TAG, "Disconnecting from AWS IoT...");
+            esp_mqtt_client_disconnect(mqtt_client);
+        }
         esp_mqtt_client_stop(mqtt_client);
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = nullptr;
         connected = false;
     }
 }
@@ -470,9 +512,6 @@ std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& d
     snprintf(gpsQuality, sizeof(gpsQuality), "%d,0", data.GPSData.rssi);
     cJSON_AddStringToObject(root, "gsq", gpsQuality);
     cJSON_AddStringToObject(root, "err", ctx.errorLogValid ? ctx.errorLog : "");
-    if (ctx.deviceStatusValid) {
-        cJSON_AddNumberToObject(root, "deviceStatus", ctx.deviceStatus);
-    }
     cJSON_AddNumberToObject(root, "raw", roundToTwoDecimals(data.AnalogFuelVoltage));
     cJSON_AddNumberToObject(root, "supv", roundToTwoDecimals(data.SensorSupplyVoltage));
 
@@ -499,6 +538,26 @@ std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& d
     if (ctx.bleAdvTimeValid)
     {
         cJSON_AddNumberToObject(root, "bleadv", ctx.bleAdvTime);
+    }
+    if (ctx.sensorSampleRateMinutesValid)
+    {
+        cJSON_AddNumberToObject(root, "ssr", ctx.sensorSampleRateMinutes);
+    }
+    if (ctx.mqttPortValid)
+    {
+        cJSON_AddStringToObject(root, "port", ctx.mqttPort);
+    }
+    if (ctx.mqttScheduledPostValid)
+    {
+        cJSON_AddStringToObject(root, "mqt", ctx.mqttScheduledPost);
+    }
+    if (ctx.eventPostsValid)
+    {
+        cJSON_AddBoolToObject(root, "evtpst", ctx.eventPosts);
+    }
+    if (ctx.eventThresholdsPctValid && ctx.eventThresholdsPct[0] != '\0')
+    {
+        cJSON_AddStringToObject(root, "evtlmt", ctx.eventThresholdsPct);
     }
 
     char* json_str = cJSON_PrintUnformatted(root);

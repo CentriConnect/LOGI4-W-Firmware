@@ -52,6 +52,10 @@ void DataSampleStateMachine::DataSampleStateUpdateLocalValues()
     // Set the timestamp from TimeKeeper (replaces placeholder value from driver)
     time_t currentTime = _timeKeeper->GetCurrentTime();
     _sensorData.elapsedTimeStampS = static_cast<uint32_t>(currentTime);
+    if (_parentStateMachine)
+    {
+        _parentStateMachine->recordSensorSampleTime(currentTime);
+    }
 
     ESP_LOGI(TAG, "  LogiSensorData:\n"
                       "    - Fuel:    Level=%u%%, AnalogV=%.2fV, SupplyV=%.2fV\n"

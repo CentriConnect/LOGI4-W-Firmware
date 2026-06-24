@@ -52,7 +52,6 @@ struct TelemetryContext
     int32_t lteSignalQuality;   // WiFi RSSI for WiFi variant
     int32_t chargerStatus;
     int32_t bleStatus;
-    int32_t deviceStatus;
     char errorLog[256];
     int16_t resetCounter;
 
@@ -63,6 +62,11 @@ struct TelemetryContext
     uint32_t lteAttemptTimeout;
     uint32_t postDwellTime;
     uint32_t bleAdvTime;
+    uint32_t sensorSampleRateMinutes;
+    char mqttPort[8];
+    char mqttScheduledPost[16];
+    bool eventPosts;
+    char eventThresholdsPct[128];
 
     // Validity flags (only fields marked valid are included in JSON)
     bool deviceIdValid;
@@ -75,7 +79,6 @@ struct TelemetryContext
     bool lteSignalQualityValid;
     bool chargerStatusValid;
     bool bleStatusValid;
-    bool deviceStatusValid;
     bool errorLogValid;
     bool resetCounterValid;
     bool postingScheduleValid;
@@ -84,6 +87,11 @@ struct TelemetryContext
     bool lteAttemptTimeoutValid;
     bool postDwellTimeValid;
     bool bleAdvTimeValid;
+    bool sensorSampleRateMinutesValid;
+    bool mqttPortValid;
+    bool mqttScheduledPostValid;
+    bool eventPostsValid;
+    bool eventThresholdsPctValid;
 };
 
 #endif // LOGI_SENSOR_DATA_H_

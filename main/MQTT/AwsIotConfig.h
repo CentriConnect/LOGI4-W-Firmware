@@ -6,6 +6,9 @@
 // AWS IoT Core Configuration
 #define AWS_IOT_ENDPOINT        "a28v8anidrrkyj-ats.iot.us-east-1.amazonaws.com"
 #define AWS_IOT_PORT            8883
+#define AWS_IOT_BACKUP_ENDPOINT "d03947153898haw74ah0o-ats.iot.us-east-1.amazonaws.com"
+#define AWS_IOT_BACKUP_PORT     443
+#define AWS_IOT_PORT443_ALPN    "x-amzn-mqtt-ca"
 
 // Identity + topics resolved at runtime from the Thing UUID written to NVS at
 // factory provisioning. Pointers below point into static buffers populated by
@@ -43,6 +46,10 @@ bool AwsIotConfig_Init(const char* thingName);
 #define AWS_IOT_MQTT_KEEPALIVE_S        60
 #define AWS_IOT_MQTT_COMMAND_TIMEOUT_MS 10000
 #define AWS_IOT_MQTT_QOS                1     // QoS 1 for at least once delivery
+
+#define AWS_IOT_ACTIVATION_WATERFALL_TIMEOUT_S 60
+#define AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S    120
+#define AWS_IOT_MIN_WATERFALL_TIMEOUT_S        60
 
 // Retry Configuration
 #define AWS_IOT_MAX_RECONNECT_ATTEMPTS  3

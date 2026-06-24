@@ -180,6 +180,23 @@ void EspNetworkManager::Deinitialize()
 
 // --- Public Methods ---
 
+bool EspNetworkManager::IsStaAssociated() const
+{
+    wifi_ap_record_t ap_info = {};
+    return esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+}
+
+bool EspNetworkManager::HasCurrentIp() const
+{
+    if (m_sta_netif == nullptr)
+    {
+        return false;
+    }
+
+    esp_netif_ip_info_t ip_info = {};
+    return esp_netif_get_ip_info(m_sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0;
+}
+
 bool EspNetworkManager::Connect(const char *ssid, const char *password)
 {
     if (!m_initialized)
@@ -200,6 +217,22 @@ bool EspNetworkManager::Connect(const char *ssid, const char *password)
     m_retry_count = 0;
     m_connected = false; // Ensure state reflects starting condition
     m_lastFailureType = WifiFailureType::WifiFailure_None;  // Clear previous failure
+
+    if (IsStaAssociated())
+    {
+        if (HasCurrentIp())
+        {
+            ESP_LOGI(TAG, "Wi-Fi driver is already associated and has IP; reusing existing connection.");
+            m_wifi_started = true;
+            m_connected = true;
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            return true;
+        }
+
+        ESP_LOGW(TAG, "Wi-Fi driver is associated without an IP; reconnecting cleanly.");
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
 
     // 1. Set Wi-Fi Configuration
     wifi_config_t wifi_config = {}; 
@@ -297,7 +330,8 @@ void EspNetworkManager::Disconnect()
         ESP_LOGE(TAG, "Disconnect failed: Network Manager not initialized.");
         return;
     }
-    if (!m_wifi_started && !m_connected)
+    const bool driverAssociated = IsStaAssociated();
+    if (!m_wifi_started && !m_connected && !driverAssociated)
     {
         ESP_LOGI(TAG, "Already disconnected/stopped.");
         return;
@@ -314,16 +348,30 @@ void EspNetworkManager::Disconnect()
     if (err_s != ESP_OK)
         ESP_LOGW(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(err_s));
 
-    m_wifi_started = false;                                                       
-    m_connected = false;                                                          
+    m_wifi_started = false;
+    m_connected = false;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT); 
     ESP_LOGI(TAG, "Wi-Fi disconnected and stopped.");
 }
 
 bool EspNetworkManager::IsConnected()
 {
-    // Return the state managed internally based on events
-    return m_initialized && m_connected;
+    if (!m_initialized)
+    {
+        return false;
+    }
+
+    if (m_connected)
+    {
+        return true;
+    }
+
+    if (IsStaAssociated() && HasCurrentIp())
+    {
+        return true;
+    }
+
+    return false;
 }
 
 // --- Static Event Handler ---
@@ -402,9 +450,9 @@ void EspNetworkManager::EventHandler(void *arg, esp_event_base_t event_base, int
 
             // Reset retry counter on success
             instance->m_retry_count = 0; 
+            instance->m_connected = true;
             // Signal successful connection (including IP)
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-            // Note: m_connected is set by Connect() after wait succeeds
             break;
         }
         default:

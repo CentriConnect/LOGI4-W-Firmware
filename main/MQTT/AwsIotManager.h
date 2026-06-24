@@ -32,6 +32,9 @@ public:
      * @return true if successful
      */
     bool Connect();
+    bool ConnectWithProfile(AwsIotConnectionProfile profile, uint32_t timeoutSeconds);
+    bool ConnectWithWaterfall(uint32_t timeoutSeconds);
+    bool IsConnectedViaBackup443() const;
     
     /**
      * @brief Disconnect from AWS IoT (call before network disconnect)

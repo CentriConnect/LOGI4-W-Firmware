@@ -1,9 +1,9 @@
 #ifndef LOGI_FAULTS_H
 #define LOGI_FAULTS_H
 
-// Per-post fault accumulator for the telemetry `err` (string codes) + `deviceStatus`
-// (int32 bitmask). Subsystems OR in a flag at their existing failure path; the
-// telemetry context renders both fields before publish and clears after a good post.
+// Per-post fault accumulator for the telemetry `err` string codes. Subsystems OR
+// in a flag at their existing failure path; the telemetry context renders `err`
+// before publish and clears after a good post.
 // See docs/err-fault-spec.md.
 
 #include <stdint.h>
@@ -35,8 +35,8 @@ uint32_t Faults_Get(void);
 // Reset the accumulator (call after a successful final post).
 void Faults_Clear(void);
 
-// Render the accumulator: err_out = comma-separated codes ("ADC,GPS"; "" if none),
-// *status_out = the raw bitmask. err_out is always NUL-terminated.
+// Render the accumulator: err_out = comma-separated codes ("ADC,GPS"; "" if none).
+// If status_out is provided, *status_out receives the raw bitmask.
 void Faults_Render(char *err_out, size_t err_len, uint32_t *status_out);
 
 #ifdef __cplusplus

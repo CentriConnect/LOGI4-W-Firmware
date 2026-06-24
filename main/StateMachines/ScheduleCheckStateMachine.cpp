@@ -15,7 +15,6 @@ static const char *TAG = "ScheduleCheckStateMachine";
 // RTC_DATA_ATTR variables survive deep sleep (stored in RTC slow memory)
 RTC_DATA_ATTR static int64_t last_post_attempt = 0;
 RTC_DATA_ATTR static bool has_valid_time = false;
-RTC_DATA_ATTR static bool very_first_post_complete = false;
 
 uint32_t SCHEDULE_LOCKOUT_TIME_S = 5U;
 
@@ -135,21 +134,6 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCheckProvisioning()
 
 void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
 {
-    // Check for initial boot post - always post on first boot to establish connection
-    if (!very_first_post_complete)
-    {
-        ESP_LOGI(TAG, "Initial boot detected - forcing first post to establish connection");
-
-        time_t current_time = _timeKeeper->GetCurrentTime();
-        update_last_post_time(static_cast<int64_t>(current_time));
-        very_first_post_complete = true;
-
-        ESP_LOGI(TAG, "Enqueued LOGI Data (initial boot post)");
-        _parentStateMachine->addToPostQueue(_sensorData);
-        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
-        return;
-    }
-
     bool noPostInLastFiveMinutes = false;
     bool withinScheduledWindow = false;
 
@@ -210,7 +194,9 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
     int currentMinutes = _timeInfo.tm_hour * 60 + _timeInfo.tm_min;
     int currentWday = _timeInfo.tm_wday;
 
-    // Check if we're within 5 minutes of any scheduled time
+    // Check if we're on any UDP or MQTT scheduled minute. Earlier builds used a
+    // +/-5 minute window, but that can fire at xx:55 and then suppress the exact
+    // xx:00 slot via the 5-minute duplicate-post lockout.
     PostTransport selectedTransport = PostTransport::PostTransport_Udp;
     char mqttSchedule[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
     int mqttHour = 0;
@@ -219,18 +205,46 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
     bool hasMqttSchedule = _deviceSettings.getMqttScheduledPost(mqttSchedule, sizeof(mqttSchedule)) &&
                            parseShadowScheduleString(mqttSchedule, mqttHour, mqttMinute, mqttDays);
 
-    for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES; ++i)
+    if (hasMqttSchedule)
+    {
+        int mqttScheduledMinutes = mqttHour * 60 + mqttMinute;
+        if ((mqttDays & (1 << currentWday)) && currentMinutes == mqttScheduledMinutes)
+        {
+            ESP_LOGI(TAG, "On MQTT scheduled post minute: mask 0x%02X, scheduled %02d:%02d, now %02d:%02d.",
+                     mqttDays,
+                     mqttHour,
+                     mqttMinute,
+                     _timeInfo.tm_hour,
+                     _timeInfo.tm_min);
+
+            withinScheduledWindow = true;
+            selectedTransport = PostTransport::PostTransport_Mqtt;
+        }
+        else if (!(mqttDays & (1 << currentWday)) && currentMinutes == mqttScheduledMinutes)
+        {
+            ESP_LOGI(TAG, "On derived UDP scheduled post minute from MQTT schedule: MQTT mask 0x%02X excludes today, scheduled %02d:%02d, now %02d:%02d.",
+                     mqttDays,
+                     mqttHour,
+                     mqttMinute,
+                     _timeInfo.tm_hour,
+                     _timeInfo.tm_min);
+
+            withinScheduledWindow = true;
+            selectedTransport = PostTransport::PostTransport_Udp;
+        }
+    }
+
+    for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES && !withinScheduledWindow; ++i)
     {
         if (schedules[i].DaysOfWeek == 0) continue;
 
         if (schedules[i].DaysOfWeek & (1 << currentWday))
         {
             int scheduledMinutes = schedules[i].StartTime.Hour * 60 + schedules[i].StartTime.Minute;
-            int deltaMinutes = abs(currentMinutes - scheduledMinutes);
 
-            if (deltaMinutes <= 5)
+            if (currentMinutes == scheduledMinutes)
             {
-                ESP_LOGI(TAG, "Within scheduled post window (±5 min): schedule mask 0x%02X, scheduled %02d:%02d, now %02d:%02d.",
+                ESP_LOGI(TAG, "On UDP scheduled post minute: schedule mask 0x%02X, scheduled %02d:%02d, now %02d:%02d.",
                          schedules[i].DaysOfWeek,
                          schedules[i].StartTime.Hour,
                          schedules[i].StartTime.Minute,
@@ -238,13 +252,7 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
                          _timeInfo.tm_min);
 
                 withinScheduledWindow = true;
-                int mqttScheduledMinutes = mqttHour * 60 + mqttMinute;
-                bool matchesMqttSchedule = hasMqttSchedule &&
-                                           (mqttDays & (1 << currentWday)) &&
-                                           (scheduledMinutes == mqttScheduledMinutes);
-                selectedTransport = matchesMqttSchedule
-                    ? PostTransport::PostTransport_Mqtt
-                    : PostTransport::PostTransport_Udp;
+                selectedTransport = PostTransport::PostTransport_Udp;
                 break; 
             }
         }
@@ -289,11 +297,11 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
         
         if (!noPostInLastFiveMinutes)
         {
-            ESP_LOGD(TAG, "Cannot post: Last post was less than 5 minutes ago");
+            ESP_LOGI(TAG, "Cannot post: last scheduled post attempt was less than/equal to 5 minutes ago");
         }
         if (!withinScheduledWindow)
         {
-            ESP_LOGD(TAG, "Cannot post: Not within scheduled window");
+            ESP_LOGI(TAG, "Cannot post: not on a scheduled minute");
         }
 
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);

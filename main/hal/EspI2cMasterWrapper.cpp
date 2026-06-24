@@ -151,7 +151,7 @@ HalI2cError EspI2cMasterWrapper::Read(uint8_t *read_buffer, size_t read_size, in
     esp_err_t err = i2c_master_receive(_dev_handle, read_buffer, read_size, xfer_timeout_ms);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "I2C Read Failed (Dev 0x%X): %s", _device_address, esp_err_to_name(err));
+        ESP_LOGD(TAG, "I2C Read Failed (Dev 0x%X): %s", _device_address, esp_err_to_name(err));
     }
     return MapError(err);
 }
@@ -172,7 +172,7 @@ HalI2cError EspI2cMasterWrapper::Write(const uint8_t *write_buffer, size_t write
     esp_err_t err = i2c_master_transmit(_dev_handle, write_buffer, write_size, xfer_timeout_ms);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "I2C Write Failed (Dev 0x%X): %s", _device_address, esp_err_to_name(err));
+        ESP_LOGD(TAG, "I2C Write Failed (Dev 0x%X): %s", _device_address, esp_err_to_name(err));
     }
     return MapError(err);
 }
@@ -192,7 +192,7 @@ HalI2cError EspI2cMasterWrapper::WriteRead(const uint8_t *write_buffer, size_t w
     esp_err_t err = i2c_master_transmit_receive(_dev_handle, write_buffer, write_size, read_buffer, read_size, xfer_timeout_ms);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "I2C WriteRead Failed (Dev 0x%X): %s", _device_address, esp_err_to_name(err));
+        ESP_LOGD(TAG, "I2C WriteRead Failed (Dev 0x%X): %s", _device_address, esp_err_to_name(err));
     }
     return MapError(err);
 }
