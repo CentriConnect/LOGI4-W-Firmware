@@ -98,6 +98,8 @@ private:
 
     std::function<void(const DeviceShadowState&)> shadow_delta_callback;
     GenericMessageCallback generic_message_callback;
+    std::string mqtt_fragment_topic;
+    std::string mqtt_fragment_data;
 
     static const char* TAG;
 };

@@ -308,7 +308,54 @@ void AwsIotClient::handleMqttEvent(esp_mqtt_event_handle_t event)
         {
             ESP_LOGD(TAG, "Received Topic: %.*s", event->topic_len, event->topic);
             std::string topic(event->topic, event->topic_len);
-            std::string data(event->data, event->data_len);
+            std::string data;
+
+            if (event->total_data_len > event->data_len)
+            {
+                if (event->current_data_offset == 0)
+                {
+                    mqtt_fragment_topic = topic;
+                    mqtt_fragment_data.clear();
+                    mqtt_fragment_data.resize(event->total_data_len);
+                }
+
+                if (mqtt_fragment_data.size() == static_cast<size_t>(event->total_data_len) &&
+                    event->current_data_offset >= 0 &&
+                    event->data_len >= 0 &&
+                    (event->current_data_offset + event->data_len) <= event->total_data_len)
+                {
+                    memcpy(&mqtt_fragment_data[event->current_data_offset], event->data, event->data_len);
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "Invalid fragmented MQTT data: offset=%d len=%d total=%d",
+                             event->current_data_offset,
+                             event->data_len,
+                             event->total_data_len);
+                    mqtt_fragment_topic.clear();
+                    mqtt_fragment_data.clear();
+                    break;
+                }
+
+                if ((event->current_data_offset + event->data_len) < event->total_data_len)
+                {
+                    ESP_LOGD(TAG, "Buffered MQTT fragment: offset=%d len=%d total=%d",
+                             event->current_data_offset,
+                             event->data_len,
+                             event->total_data_len);
+                    break;
+                }
+
+                topic = mqtt_fragment_topic;
+                data = mqtt_fragment_data;
+                mqtt_fragment_topic.clear();
+                mqtt_fragment_data.clear();
+                ESP_LOGD(TAG, "Reassembled MQTT payload, len=%u", static_cast<unsigned>(data.size()));
+            }
+            else
+            {
+                data.assign(event->data, event->data_len);
+            }
 
             if (topic.find("/shadow/get/accepted") != std::string::npos) 
             {
