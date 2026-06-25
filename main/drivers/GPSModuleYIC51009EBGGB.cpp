@@ -7,10 +7,40 @@
 #include <cstring>
 #include <algorithm>
 
+static int tokenizeNmeaPreserveEmpty(char *buf, char *tokens[], int maxTokens)
+{
+    if (buf == nullptr || tokens == nullptr || maxTokens <= 0) {
+        return 0;
+    }
+
+    int count = 0;
+    tokens[count++] = buf;
+
+    for (char *p = buf; *p != '\0' && count < maxTokens; ++p) {
+        if (*p == ',') {
+            *p = '\0';
+            tokens[count++] = p + 1;
+        }
+    }
+
+    return count;
+}
+
+static bool isNmeaSentenceType(const char* sentenceId, const char* type)
+{
+    return sentenceId != nullptr &&
+           type != nullptr &&
+           strlen(sentenceId) >= 6 &&
+           sentenceId[0] == '$' &&
+           strncmp(sentenceId + 3, type, 3) == 0;
+}
+
 // Constructor
 GPSModuleYIC51009EBGGB::GPSModuleYIC51009EBGGB(EspUartWrapper& uartWrapper)
     : _uartWrapper(uartWrapper), _hasValidFix(false), _event_handler_instance(nullptr),
-      _powerOnTimestampMs(0), _ttffMeasured(false)
+      _powerOnTimestampMs(0), _ttffMeasured(false),
+      _sentencesProcessed(0), _ggaSentences(0), _rmcSentences(0), _gllSentences(0),
+      _gsvSentences(0), _gsaSentences(0), _nmeaDiagSentences(0)
 {
     memset(&_currentData, 0, sizeof(_currentData));
     memset(_nmeaBuffer, 0, sizeof(_nmeaBuffer));
@@ -93,28 +123,40 @@ void GPSModuleYIC51009EBGGB::uart_event_handler(void* handler_arg, esp_event_bas
 // Process incoming NMEA data
 void GPSModuleYIC51009EBGGB::processNmeaData(const char* data, size_t length)
 {
-    // Process each line in the received data
-    const char* line = data;
-    while (*line && line < data + length) {
-        const char* next_line = strchr(line, '\n');
-        size_t len = next_line ? (size_t)(next_line - line) : strlen(line);
+    if (data == nullptr || length == 0) {
+        return;
+    }
 
-        if (len > 0 && len < 256) { // Reasonable NMEA sentence length
-            char sentence[256] = {0};
-            strncpy(sentence, line, len);
-            sentence[len] = '\0';
+    size_t bufferedLen = strlen(_nmeaBuffer);
+    if (bufferedLen + length >= sizeof(_nmeaBuffer)) {
+        ESP_LOGW(TAG, "NMEA buffer overflow; dropping partial sentence");
+        _nmeaBuffer[0] = '\0';
+        bufferedLen = 0;
+    }
 
-            // Remove \r if present
-            char* cr = strchr(sentence, '\r');
-            if (cr) *cr = '\0';
+    size_t copyLen = std::min(length, sizeof(_nmeaBuffer) - bufferedLen - 1);
+    memcpy(_nmeaBuffer + bufferedLen, data, copyLen);
+    _nmeaBuffer[bufferedLen + copyLen] = '\0';
 
-            // Parse if it looks like a valid NMEA sentence
-            if (sentence[0] == '$') {
-                parseNmeaSentence(sentence);
-            }
+    char *lineStart = _nmeaBuffer;
+    char *newline = nullptr;
+    while ((newline = strchr(lineStart, '\n')) != nullptr) {
+        *newline = '\0';
+
+        char *cr = strchr(lineStart, '\r');
+        if (cr) {
+            *cr = '\0';
         }
 
-        line = next_line ? (next_line + 1) : (data + length);
+        if (lineStart[0] == '$') {
+            parseNmeaSentence(lineStart);
+        }
+
+        lineStart = newline + 1;
+    }
+
+    if (lineStart != _nmeaBuffer) {
+        memmove(_nmeaBuffer, lineStart, strlen(lineStart) + 1);
     }
 }
 
@@ -127,28 +169,35 @@ void GPSModuleYIC51009EBGGB::parseNmeaSentence(const char* sentence)
     
     // Tokenize the sentence
     char* tokens[30] = {nullptr};
-    int tokenCount = 0;
-    char* token = strtok(buffer, ",");
-    
-    while (token && tokenCount < 30) {
-        tokens[tokenCount++] = token;
-        token = strtok(nullptr, ",");
-    }
+    int tokenCount = tokenizeNmeaPreserveEmpty(buffer, tokens, 30);
     
     if (tokenCount < 2) return;
     
     // Process based on sentence type
     bool dataUpdated = false;
-    
-    if (strncmp(tokens[0], "$GNGGA", 6) == 0) {
+    _sentencesProcessed++;
+
+    if ((isNmeaSentenceType(tokens[0], "GSA") || isNmeaSentenceType(tokens[0], "GSV")) &&
+        !_hasValidFix &&
+        _nmeaDiagSentences < 8) {
+        ESP_LOGI(TAG, "NMEA diag: %s", sentence);
+        _nmeaDiagSentences++;
+    }
+
+    if (isNmeaSentenceType(tokens[0], "GGA")) {
+        _ggaSentences++;
         dataUpdated = parseGNGGA(tokens, tokenCount);
-    } else if (strncmp(tokens[0], "$GNGLL", 6) == 0) {
+    } else if (isNmeaSentenceType(tokens[0], "GLL")) {
+        _gllSentences++;
         dataUpdated = parseGNGLL(tokens, tokenCount);
-    } else if (strncmp(tokens[0], "$GNRMC", 6) == 0) {
+    } else if (isNmeaSentenceType(tokens[0], "RMC")) {
+        _rmcSentences++;
         dataUpdated = parseGNRMC(tokens, tokenCount);
-    } else if (strncmp(tokens[0], "$GNGSV", 6) == 0 || strncmp(tokens[0], "$GPGSV", 6) == 0) {
+    } else if (isNmeaSentenceType(tokens[0], "GSV")) {
+        _gsvSentences++;
         parseGNGSV(tokens, tokenCount);
-    } else if (strncmp(tokens[0], "$GNGSA", 6) == 0 || strncmp(tokens[0], "$GPGSA", 6) == 0) {
+    } else if (isNmeaSentenceType(tokens[0], "GSA")) {
+        _gsaSentences++;
         parseGNGSA(tokens, tokenCount);
     }
     
@@ -413,6 +462,22 @@ void GPSModuleYIC51009EBGGB::PrintStatus() const
         ESP_LOGI(TAG, "  RSSI/SNR:  %d dB", _currentData.rssi);
     } else {
         ESP_LOGI(TAG, "GPS Status: NO VALID FIX");
+        ESP_LOGI(TAG, "  Sentences: %lu total, GGA=%lu, RMC=%lu, GLL=%lu, GSA=%lu, GSV=%lu",
+                 static_cast<unsigned long>(_sentencesProcessed),
+                 static_cast<unsigned long>(_ggaSentences),
+                 static_cast<unsigned long>(_rmcSentences),
+                 static_cast<unsigned long>(_gllSentences),
+                 static_cast<unsigned long>(_gsaSentences),
+                 static_cast<unsigned long>(_gsvSentences));
+        ESP_LOGI(TAG, "  Fix Type:  %d, Sats Used/View: %d/%d, SNR: %d dB",
+                 _currentData.fixType,
+                 _currentData.satellitesUsed,
+                 _currentData.satellitesInView,
+                 _currentData.rssi);
+        ESP_LOGI(TAG, "  DOP (H/P/V): %.1f/%.1f/%.1f",
+                 _currentData.hdop,
+                 _currentData.pdop,
+                 _currentData.vdop);
     }
 }
 

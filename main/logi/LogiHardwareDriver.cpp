@@ -563,10 +563,22 @@ void LogiHardwareDriver::SetGnssPower(bool on)
 {
     // Power the GNSS module independently of a measurement cycle so it can
     // acquire a fix in the background (e.g. across the activation cycle).
-    _gnssEnableGpio.Write(on);
     if (on)
     {
+        // Match the hardware-test power-up sequence: hold reset low while power
+        // comes up, then release reset after the GNSS rail is stable.
+        _gnssResetGpio.Write(false); // GNSS_RESET_N is active LOW
+        vTaskDelay(pdMS_TO_TICKS(20));
+        _gnssEnableGpio.Write(true);
+        vTaskDelay(pdMS_TO_TICKS(50));
         _gnssResetGpio.Write(true);  // release GNSS_RESET_N so the module runs
+        vTaskDelay(pdMS_TO_TICKS(100));
+        _gps_sensor.WakeUp();
+    }
+    else
+    {
+        _gnssResetGpio.Write(false);
+        _gnssEnableGpio.Write(false);
     }
     LOGI_DRV_LOG_DBG("GNSS power %s", on ? "ON" : "OFF");
 }

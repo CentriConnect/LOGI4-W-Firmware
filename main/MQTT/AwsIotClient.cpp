@@ -469,14 +469,13 @@ std::string AwsIotClient::createTelemetryJson(const LogiSensorData& data)
     cJSON_AddStringToObject(root, "sch", schema);
 
     char version[64];
-    snprintf(version, sizeof(version), "%d.%d,%d.%d,%d.%d.%d",
+    snprintf(version, sizeof(version), "%d.%d.%d,0.0,%d.%d.%d",
              CONFIG_LOGI_HARDWARE_VERSION_MAJOR,
              CONFIG_LOGI_HARDWARE_VERSION_MINOR,
+             CONFIG_LOGI_HARDWARE_VERSION_REVISION,
              CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
              CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
-             CONFIG_LOGI_MQTT_VERSION_MAJOR,
-             CONFIG_LOGI_MQTT_VERSION_MINOR,
-             CONFIG_LOGI_MQTT_VERSION_REVISION);
+             CONFIG_LOGI_SOFTWARE_VERSION_REVISION);
     cJSON_AddStringToObject(root, "ver", version);
 
     wifi_ap_record_t ap_info;

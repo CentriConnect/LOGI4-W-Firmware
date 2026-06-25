@@ -97,8 +97,11 @@ private:
     // Activation sensor snapshot. Sampled for the initial ack post, then
     // refreshed once more immediately before the final post after the GPS wait.
     LogiSensorData _firstBootSensorSnapshot{};
+    GpsData_t _firstBootGpsSnapshot{};
+    bool _firstBootGpsSnapshotValid = false;
     int64_t _firstBootStepStartMs = 0;
     int64_t _firstBootGpsStartMs = 0;
+    int64_t _firstBootLastGpsLogMs = 0;
 
     EspNvsStorage* _nvsStorage;
     EspBluetoothManager* _bleManager;
@@ -132,6 +135,7 @@ private:
     esp_err_t getDevicePop(char* pop, size_t maxLen);
     bool publishFirstBootTelemetry(AwsIotClient* client);
     bool publishFirstBootUdpTelemetry();
+    bool reconnectForFinalActivationPost();
     void populateFirstBootTelemetryContext(TelemetryContext& context, const LogiSensorData& data) const;
 
     esp_err_t backupCurrentCredentials();

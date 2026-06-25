@@ -11,6 +11,7 @@
 #include <cstring>
 #include "logi/ResetCounter.h"
 #include "logi/Faults.h"
+#include "MQTT/AwsIotConfig.h"
 #include "UDP/UdpTelemetryClient.h"
 
 ESP_EVENT_DECLARE_BASE(LOGI_PROV_TIMEOUT_EVENT);
@@ -26,6 +27,7 @@ const char* ProvisioningStateMachine::NVS_WIFI_PASS_KEY = "wifi_pass";
 const char* ProvisioningStateMachine::NVS_BACKUP_SSID_KEY = "backup_ssid";
 const char* ProvisioningStateMachine::NVS_BACKUP_PASS_KEY = "backup_pass";
 static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
+static constexpr uint32_t PROVISIONING_SUCCESS_BLE_GRACE_MS = 3000;
 
 static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceSettings,
                                                          const DeviceShadowState& parsedShadowState)
@@ -128,6 +130,9 @@ bool ProvisioningStateMachine::init(ProvisioningMode mode)
     _successDisplayStartMs = 0;
     _stateEnteredMs = esp_timer_get_time() / 1000; // arm deadman from init
     _firstBootGpsStartMs = 0;
+    _firstBootLastGpsLogMs = 0;
+    _firstBootGpsSnapshot = {};
+    _firstBootGpsSnapshotValid = false;
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
@@ -164,9 +169,15 @@ void ProvisioningStateMachine::update()
     if (_currentState != ProvisioningState::ProvisioningState_Advertising &&
         _currentState != ProvisioningState::ProvisioningState_SuccessDisplay) {
         int64_t in_state_ms = (esp_timer_get_time() / 1000) - _stateEnteredMs;
-        if (_stateEnteredMs != 0 && in_state_ms > TRANSIENT_STATE_DEADMAN_MS) {
+        int64_t deadman_ms = TRANSIENT_STATE_DEADMAN_MS;
+        if (_currentState == ProvisioningState::ProvisioningState_PostJobsShadow &&
+            _firstBootSubStep == 3) {
+            deadman_ms = ACTIVATION_GPS_TIMEOUT_MS + (60LL * 1000LL);
+        }
+
+        if (_stateEnteredMs != 0 && in_state_ms > deadman_ms) {
             ESP_LOGE(TAG, "DEADMAN: state %d stuck for %lld ms (limit %lld) - rebooting (creds preserved)",
-                     static_cast<int>(_currentState), in_state_ms, TRANSIENT_STATE_DEADMAN_MS);
+                     static_cast<int>(_currentState), in_state_ms, deadman_ms);
             vTaskDelay(pdMS_TO_TICKS(100)); // log flush
             if (_powerManager) {
                 _powerManager->Reboot();
@@ -346,6 +357,9 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
             return;
         }
 
+        ESP_LOGI(TAG, "Provisioning success confirmed; waiting %lu ms before BLE teardown",
+                 static_cast<unsigned long>(PROVISIONING_SUCCESS_BLE_GRACE_MS));
+        vTaskDelay(pdMS_TO_TICKS(PROVISIONING_SUCCESS_BLE_GRACE_MS));
         stopProvisioningService();
         _provisioningComplete = true;
         _provisioningSuccess = true;
@@ -369,6 +383,9 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
     }
 
     // All three checks passed: creds received, AWS connected, NVS write succeeded
+    ESP_LOGI(TAG, "Provisioning success confirmed; waiting %lu ms before BLE teardown",
+             static_cast<unsigned long>(PROVISIONING_SUCCESS_BLE_GRACE_MS));
+    vTaskDelay(pdMS_TO_TICKS(PROVISIONING_SUCCESS_BLE_GRACE_MS));
     stopProvisioningService();
 
     _provisioningComplete = true;
@@ -498,7 +515,10 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: request pending jobs");
         if (_awsIotManager->IsConnectedViaBackup443()) {
             ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [3/4]: backup AWS MQTT 443 link active; skipping jobs/OTA");
+            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: closing AWS MQTT before GPS acquisition");
+            _awsIotManager->Disconnect();
             _firstBootGpsStartMs = esp_timer_get_time() / 1000;
+            _firstBootLastGpsLogMs = 0;
             _firstBootSubStep = 3;
             break;
         }
@@ -508,7 +528,10 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
         } else {
             ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [3/4]: no jobs handler — skipped");
         }
+        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [3/4]: closing AWS MQTT before GPS acquisition");
+        _awsIotManager->Disconnect();
         _firstBootGpsStartMs = esp_timer_get_time() / 1000;
+        _firstBootLastGpsLogMs = 0;
         _firstBootSubStep = 3;
         break;
     }
@@ -520,7 +543,9 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
         if (_driver) {
             int64_t gpsElapsedMs = (esp_timer_get_time() / 1000) - _firstBootGpsStartMs;
             if (!_driver->HasValidGpsFix() && gpsElapsedMs < GPS_WAIT_MS) {
-                if ((gpsElapsedMs % GPS_LOG_INTERVAL_MS) < 300) {
+                if (_firstBootLastGpsLogMs == 0 ||
+                    (gpsElapsedMs - _firstBootLastGpsLogMs) >= GPS_LOG_INTERVAL_MS) {
+                    _firstBootLastGpsLogMs = gpsElapsedMs;
                     ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [4/5]: waiting for GPS fix before confirm POST: %lld/%lld ms",
                              gpsElapsedMs,
                              GPS_WAIT_MS);
@@ -531,6 +556,7 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
             }
 
             if (_driver->HasValidGpsFix()) {
+                _firstBootGpsSnapshotValid = _driver->GetGpsData(_firstBootGpsSnapshot) && _firstBootGpsSnapshot.valid;
                 ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [4/5]: GPS fix acquired before confirm POST");
             } else {
                 ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [4/5]: GPS fix not acquired before timeout; confirm POST will use defaults");
@@ -544,9 +570,15 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
 
     case 4: {
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: resample + confirming POST after shadow apply");
-        if (client) {
-            bool ok = publishFirstBootTelemetry(client);
-            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: POST %s", ok ? "ok" : "FAILED");
+        bool ok = false;
+        if (reconnectForFinalActivationPost()) {
+            AwsIotClient* finalClient = _awsIotManager ? _awsIotManager->GetAwsClient() : nullptr;
+            ok = publishFirstBootTelemetry(finalClient);
+            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: final MQTT POST %s", ok ? "ok" : "FAILED");
+        } else {
+            ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [5/5]: final MQTT reconnect failed; using compact UDP activation fallback");
+            ok = publishFirstBootUdpTelemetry();
+            ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: final UDP fallback POST %s", ok ? "ok" : "FAILED");
         }
         _firstBootSubStep = 5;
         break;
@@ -776,6 +808,9 @@ bool ProvisioningStateMachine::publishFirstBootTelemetry(AwsIotClient* client)
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: resampling sensors/peripherals before final activation POST");
         _driver->UpdateMeasurements();
         _driver->GetLatestSensorData(_firstBootSensorSnapshot);
+        if (_firstBootGpsSnapshotValid) {
+            _firstBootSensorSnapshot.GPSData = _firstBootGpsSnapshot;
+        }
         _driver->SetGnssPower(false);
     }
 
@@ -795,6 +830,9 @@ bool ProvisioningStateMachine::publishFirstBootUdpTelemetry()
     if (_driver) {
         _driver->UpdateMeasurements();
         _driver->GetLatestSensorData(_firstBootSensorSnapshot);
+        if (_firstBootGpsSnapshotValid) {
+            _firstBootSensorSnapshot.GPSData = _firstBootGpsSnapshot;
+        }
         _driver->SetGnssPower(false);
     }
 
@@ -808,6 +846,39 @@ bool ProvisioningStateMachine::publishFirstBootUdpTelemetry()
     populateFirstBootTelemetryContext(context, _firstBootSensorSnapshot);
     ESP_LOGI(TAG, "Publishing activation telemetry via compact UDP fallback");
     return UdpTelemetryClient::SendTelemetry(_firstBootSensorSnapshot, context);
+}
+
+bool ProvisioningStateMachine::reconnectForFinalActivationPost()
+{
+    if (_awsIotManager == nullptr)
+    {
+        ESP_LOGE(TAG, "REQ-FIRSTBOOT-01 [5/5]: no AWS IoT manager for final activation reconnect");
+        return false;
+    }
+
+    AwsIotClient* client = _awsIotManager->GetAwsClient();
+    if (client != nullptr && client->IsConnected())
+    {
+        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: refreshing AWS MQTT connection before final activation POST");
+        _awsIotManager->Disconnect();
+    }
+    else
+    {
+        ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [5/5]: AWS MQTT not connected before final activation POST; reconnecting");
+    }
+
+    bool connected = _awsIotManager->ConnectWithWaterfall(AWS_IOT_ACTIVATION_WATERFALL_TIMEOUT_S);
+    if (connected)
+    {
+        ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: final activation MQTT reconnect ok on port %s",
+                 _awsIotManager->IsConnectedViaBackup443() ? "443" : "8883");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "REQ-FIRSTBOOT-01 [5/5]: final activation MQTT reconnect failed");
+    }
+
+    return connected;
 }
 
 void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContext& ctx, const LogiSensorData& data) const
@@ -901,14 +972,13 @@ void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContex
              CONFIG_LOGI_MQTT_VERSION_REVISION);
     ctx.mqttSchemaValid = true;
 
-    snprintf(ctx.deviceVersion, sizeof(ctx.deviceVersion), "%d.%d,%d.%d,%d.%d.%d",
+    snprintf(ctx.deviceVersion, sizeof(ctx.deviceVersion), "%d.%d.%d,0.0,%d.%d.%d",
              CONFIG_LOGI_HARDWARE_VERSION_MAJOR,
              CONFIG_LOGI_HARDWARE_VERSION_MINOR,
+             CONFIG_LOGI_HARDWARE_VERSION_REVISION,
              CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
              CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
-             CONFIG_LOGI_MQTT_VERSION_MAJOR,
-             CONFIG_LOGI_MQTT_VERSION_MINOR,
-             CONFIG_LOGI_MQTT_VERSION_REVISION);
+             CONFIG_LOGI_SOFTWARE_VERSION_REVISION);
     ctx.deviceVersionValid = true;
 
     wifi_ap_record_t apInfo;

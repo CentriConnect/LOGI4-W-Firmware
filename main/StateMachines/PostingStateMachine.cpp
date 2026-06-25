@@ -1065,15 +1065,14 @@ void PostingStateMachine::populateTelemetryContext(TelemetryContext& ctx) const
              CONFIG_LOGI_MQTT_VERSION_REVISION);
     ctx.mqttSchemaValid = true;
 
-    // === Device Version (HW, SW, MQTT schema major.minor) ===
-    snprintf(ctx.deviceVersion, sizeof(ctx.deviceVersion), "%d.%d,%d.%d,%d.%d.%d",
+    // === Device Version (HW, modem placeholder, SW) ===
+    snprintf(ctx.deviceVersion, sizeof(ctx.deviceVersion), "%d.%d.%d,0.0,%d.%d.%d",
              CONFIG_LOGI_HARDWARE_VERSION_MAJOR,
              CONFIG_LOGI_HARDWARE_VERSION_MINOR,
+             CONFIG_LOGI_HARDWARE_VERSION_REVISION,
              CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
              CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
-             CONFIG_LOGI_MQTT_VERSION_MAJOR,
-             CONFIG_LOGI_MQTT_VERSION_MINOR,
-             CONFIG_LOGI_MQTT_VERSION_REVISION);
+             CONFIG_LOGI_SOFTWARE_VERSION_REVISION);
     ctx.deviceVersionValid = true;
 
     // === Modem Firmware Version (empty for WiFi variant) ===

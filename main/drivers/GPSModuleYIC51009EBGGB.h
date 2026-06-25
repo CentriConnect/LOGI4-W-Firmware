@@ -61,6 +61,13 @@ private:
     // TTFF measurement
     uint32_t _powerOnTimestampMs;
     bool _ttffMeasured;
+    uint32_t _sentencesProcessed;
+    uint32_t _ggaSentences;
+    uint32_t _rmcSentences;
+    uint32_t _gllSentences;
+    uint32_t _gsvSentences;
+    uint32_t _gsaSentences;
+    uint32_t _nmeaDiagSentences;
 
     // Event handler for UART data
     static void uart_event_handler(void* handler_arg, esp_event_base_t base, 
