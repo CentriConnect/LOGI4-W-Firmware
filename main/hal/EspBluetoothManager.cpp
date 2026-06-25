@@ -149,7 +149,7 @@ void EspBluetoothManager::inactivityTimerCb(TimerHandle_t xTimer)
 
 // ===== Public ADV API =====
 
-bool EspBluetoothManager::startAdvertising(const char* name)
+bool EspBluetoothManager::startAdvertising(const char* name, uint32_t intervalMs)
 {
     if (name && name[0] != '\0')
     {
@@ -157,6 +157,15 @@ bool EspBluetoothManager::startAdvertising(const char* name)
         strncpy(_advName, name, sizeof(_advName) - 1);
         _advName[sizeof(_advName) - 1] = '\0';
     }
+    if (intervalMs < 20)
+    {
+        intervalMs = 20;
+    }
+    if (intervalMs > 10240)
+    {
+        intervalMs = 10240;
+    }
+    _advIntervalMs = intervalMs;
 
     if (!_initialized)
     {
@@ -268,12 +277,10 @@ void EspBluetoothManager::startAdvertisingInternal()
 
     ap.conn_mode = BLE_GAP_CONN_MODE_UND;
     ap.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    // REQ-PROV-02: 1000 ms BLE ADV interval during prov window (matches the
-    // power study sweet spot of ~3.79 mA / ~111 days at 1000 ms with light
-    // sleep enabled). Was 100-150 ms. BLE units = 0.625 ms; 1000 ms = 0x0640.
-    // Per Nick 2026-06-01 #6. Shadow ble_adv_time override (PDEC-013) not yet wired.
-    ap.itvl_min  = 0x0640; // 1000 ms
-    ap.itvl_max  = 0x0640; // 1000 ms
+    // BLE units = 0.625 ms. 1000 ms = 0x0640, 8000 ms = 0x3200.
+    uint16_t intervalUnits = static_cast<uint16_t>((_advIntervalMs * 8U) / 5U);
+    ap.itvl_min = intervalUnits;
+    ap.itvl_max = intervalUnits;
 
     ble_gap_adv_start(_ownAddrType, NULL, BLE_HS_FOREVER, &ap,
                       &EspBluetoothManager::gapEventCb, this);

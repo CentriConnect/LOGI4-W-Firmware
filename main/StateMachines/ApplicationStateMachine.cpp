@@ -13,7 +13,12 @@
 
 // RTC memory for auth failure tracking (persists through deep sleep, reset on power-on)
 RTC_DATA_ATTR static uint8_t s_authFailureCount = 0;
+RTC_DATA_ATTR static int64_t s_wifiOutageStartTime = 0;
+RTC_DATA_ATTR static bool s_wifiRepairAdvertisingRequested = false;
+RTC_DATA_ATTR static bool s_repairBleConnectionRequested = false;
 static constexpr uint8_t AUTH_FAILURE_THRESHOLD = 10;
+static constexpr int64_t WIFI_REPAIR_ADVERTISING_DELAY_S = 24LL * 60LL * 60LL;
+static constexpr uint32_t WIFI_REPAIR_BLE_ADV_INTERVAL_MS = 8000;
 #include "DataSampleStateMachine.h"
 #include "CheckFillDetectStateMachine.h"
 #include "ScheduleCheckStateMachine.h"
@@ -183,6 +188,7 @@ bool ApplicationStateMachine::init()
 
     // Initialize BLE manager - always advertising when awake for manual provisioning trigger
     _bleManager = std::make_unique<EspBluetoothManager>();
+    _bleManager->setConnectionCallback([this]() { this->onRepairBleConnection(); });
     // Note: BLE advertising will be started after WiFi init to get MAC address
     ESP_LOGI(TAG, "Bluetooth Manager created.");
 
@@ -276,6 +282,16 @@ void ApplicationStateMachine::update()
     if (!_isInitialized)
     {
         ESP_LOGE(TAG, "Update called before successful initialization!");
+        return;
+    }
+
+    if (s_repairBleConnectionRequested &&
+        currentState != ApplicationState::ApplicationState_Provisioning)
+    {
+        s_repairBleConnectionRequested = false;
+        ESP_LOGI(TAG, "Repair BLE connection request observed in app loop");
+        stopWifiRepairAdvertising();
+        enterProvisioningMode(ProvisioningMode::ReProvision);
         return;
     }
 
@@ -400,6 +416,8 @@ void ApplicationStateMachine::enterProvisioningMode(ProvisioningMode mode)
     ESP_LOGI(TAG, "Entering provisioning mode: %s",
              mode == ProvisioningMode::FirstBoot ? "FirstBoot" : "ReProvision");
 
+    stopWifiRepairAdvertising();
+
     if (!_provisioningStateMachine) {
         _provisioningStateMachine = std::make_unique<ProvisioningStateMachine>(
             &_settingsStorage,
@@ -420,6 +438,154 @@ void ApplicationStateMachine::enterProvisioningMode(ProvisioningMode mode)
         ESP_LOGE(TAG, "Failed to initialize provisioning state machine");
         // Fall back to sleep on failure
         transitionTo(ApplicationState::ApplicationState_Sleep);
+    }
+}
+
+void ApplicationStateMachine::onRepairBleConnection()
+{
+    ESP_LOGI(TAG, "Repair BLE connection received - requesting re-provisioning");
+    s_repairBleConnectionRequested = true;
+}
+
+void ApplicationStateMachine::buildBleServiceName(char *serviceName, size_t maxLen) const
+{
+    if (serviceName == nullptr || maxLen == 0)
+    {
+        return;
+    }
+
+    if (_deviceSettings.isDeviceIdValid())
+    {
+        char uuid[DeviceSettings::DEVICE_ID_BUFFER_SIZE] = {0};
+        if (_deviceSettings.getDeviceId(uuid, sizeof(uuid)))
+        {
+            char prefix[5] = {0};
+            strncpy(prefix, uuid, 4);
+            snprintf(serviceName, maxLen, "MyPropane-%s", prefix);
+            return;
+        }
+    }
+
+    snprintf(serviceName, maxLen, "MyPropane");
+}
+
+void ApplicationStateMachine::markWifiOutageStarted(time_t now)
+{
+    if (s_wifiOutageStartTime == 0 && now > 0)
+    {
+        s_wifiOutageStartTime = static_cast<int64_t>(now);
+        ESP_LOGW(TAG, "Wi-Fi outage timer started at %lld", s_wifiOutageStartTime);
+    }
+}
+
+void ApplicationStateMachine::clearWifiOutage()
+{
+    if (s_wifiOutageStartTime != 0 || s_wifiRepairAdvertisingRequested)
+    {
+        ESP_LOGI(TAG, "Wi-Fi recovered; clearing outage timer and repair advertising");
+    }
+    s_wifiOutageStartTime = 0;
+    s_wifiRepairAdvertisingRequested = false;
+    stopWifiRepairAdvertising();
+}
+
+bool ApplicationStateMachine::isWifiOutageRepairDue(time_t now) const
+{
+    return now > 0 &&
+           s_wifiOutageStartTime > 0 &&
+           (static_cast<int64_t>(now) - s_wifiOutageStartTime) >= WIFI_REPAIR_ADVERTISING_DELAY_S;
+}
+
+void ApplicationStateMachine::startWifiRepairAdvertisingIfDue(time_t now)
+{
+    if (!isWifiOutageRepairDue(now) || !_bleManager)
+    {
+        return;
+    }
+
+    if (!_bleManager->isInitialized())
+    {
+        _bleManager->init();
+        _bleManager->startHost();
+    }
+
+    char serviceName[32] = {0};
+    buildBleServiceName(serviceName, sizeof(serviceName));
+
+    if (!_bleManager->isAdvertising())
+    {
+        ESP_LOGW(TAG, "Wi-Fi outage >24h; starting connectable BLE repair advertising (%s, %lu ms)",
+                 serviceName,
+                 static_cast<unsigned long>(WIFI_REPAIR_BLE_ADV_INTERVAL_MS));
+        _bleManager->startAdvertising(serviceName, WIFI_REPAIR_BLE_ADV_INTERVAL_MS);
+    }
+
+    s_wifiRepairAdvertisingRequested = true;
+}
+
+void ApplicationStateMachine::stopWifiRepairAdvertising()
+{
+    if (_bleManager && _bleManager->isInitialized())
+    {
+        _bleManager->stopAdvertising();
+        _bleManager->deinit();
+    }
+    s_wifiRepairAdvertisingRequested = false;
+}
+
+void ApplicationStateMachine::waitAwakeWithRepairAdvertising(uint64_t durationUs)
+{
+    if (_powerManager)
+    {
+        _powerManager->AllowLightSleep(true);
+    }
+
+    const uint64_t sliceMs = 1000;
+    uint64_t remainingMs = durationUs / 1000ULL;
+    if (remainingMs == 0)
+    {
+        remainingMs = 1;
+    }
+
+    ESP_LOGW(TAG, "Wi-Fi repair advertising active; staying awake/light-sleeping for %llu ms",
+             remainingMs);
+
+    while (remainingMs > 0)
+    {
+        if (s_repairBleConnectionRequested)
+        {
+            ESP_LOGI(TAG, "Repair BLE connection requested during awake wait");
+            break;
+        }
+
+        uint64_t delayMs = remainingMs < sliceMs ? remainingMs : sliceMs;
+        vTaskDelay(pdMS_TO_TICKS(delayMs));
+        remainingMs -= delayMs;
+    }
+
+    if (_powerManager)
+    {
+        _powerManager->AllowLightSleep(false);
+    }
+}
+
+void ApplicationStateMachine::resetDutyCycleStateMachines()
+{
+    if (_dataSampleStateMachine)
+    {
+        _dataSampleStateMachine->transitionTo(DataSampleState::DataSampleState_SampleSensorData);
+    }
+    if (_scheduleCheckStateMachine)
+    {
+        _scheduleCheckStateMachine->transitionTo(ScheduleCheckState::ScheduleCheckState_ValidateDateTime);
+    }
+    if (_checkFillDetectStateMachine)
+    {
+        _checkFillDetectStateMachine->transitionTo(CheckFillDetectState::CheckFillDetectState_CheckInDwellMode);
+    }
+    if (_postingStateMachine)
+    {
+        _postingStateMachine->transitionTo(PostingState::PostingState_InitialEnter);
     }
 }
 
@@ -452,14 +618,18 @@ bool ApplicationStateMachine::checkAndConnectWifi()
         _settingsStorage.LoadString(ProvisioningStateMachine::NVS_WIFI_PASS_KEY, password, sizeof(password))) {
 
         ESP_LOGI(TAG, "Connecting to WiFi (SSID: %s)...", ssid);
+        time_t now = _timeKeeper.GetCurrentTime();
+        startWifiRepairAdvertisingIfDue(now);
         bool connected = _networkManager->Connect(ssid, password);
 
         if (connected) {
             ESP_LOGI(TAG, "WiFi connected successfully");
             s_authFailureCount = 0;
+            clearWifiOutage();
             return true;
         } else {
             ESP_LOGW(TAG, "WiFi connection failed");
+            markWifiOutageStarted(now);
             WifiFailureType failureType = _networkManager->GetLastFailureType();
             switch (failureType) {
                 case WifiFailureType::WifiFailure_AuthError:
@@ -473,17 +643,19 @@ bool ApplicationStateMachine::checkAndConnectWifi()
                     break;
 
                 case WifiFailureType::WifiFailure_ApNotFound:
-                    ESP_LOGW(TAG, "AP not found - SSID may have changed, entering re-provisioning mode");
+                    ESP_LOGW(TAG, "AP not found - preserving credentials and retrying on future post windows");
                     s_authFailureCount = 0;
-                    enterProvisioningMode(ProvisioningMode::ReProvision);
+                    startWifiRepairAdvertisingIfDue(_timeKeeper.GetCurrentTime());
                     break;
 
                 case WifiFailureType::WifiFailure_Timeout:
                     ESP_LOGW(TAG, "Connection timeout - will retry on next scheduled post");
+                    startWifiRepairAdvertisingIfDue(_timeKeeper.GetCurrentTime());
                     break;
 
                 default:
                     ESP_LOGW(TAG, "Unknown WiFi failure type");
+                    startWifiRepairAdvertisingIfDue(_timeKeeper.GetCurrentTime());
                     break;
             }
             return false;
@@ -531,16 +703,38 @@ void ApplicationStateMachine::ApplicationStateSleep()
 {
     time_t current_time = _timeKeeper.GetCurrentTime();
     uint64_t sleep_duration_us = calculateSleepDurationFrom(current_time);
+    const bool repairAdvertisingDue = isWifiOutageRepairDue(current_time);
 
-    ESP_LOGI(TAG, "All tasks complete. Entering deep sleep for %llu us...", sleep_duration_us);
+    ESP_LOGI(TAG, "All tasks complete. %s for %llu us...",
+             repairAdvertisingDue ? "Staying discoverable in repair BLE mode" : "Entering deep sleep",
+             sleep_duration_us);
 
-    // Ensure LED is off before entering deep sleep
+    // Ensure LED is off before sleeping or repair wait
     if (_logiHardwareDriver)
     {
         _logiHardwareDriver->SetLedState(LedState::LedState_Off);
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (repairAdvertisingDue)
+    {
+        _networkManager->Disconnect();
+        startWifiRepairAdvertisingIfDue(current_time);
+        waitAwakeWithRepairAdvertising(sleep_duration_us);
+
+        if (s_repairBleConnectionRequested)
+        {
+            s_repairBleConnectionRequested = false;
+            stopWifiRepairAdvertising();
+            enterProvisioningMode(ProvisioningMode::ReProvision);
+            return;
+        }
+
+        resetDutyCycleStateMachines();
+        transitionTo(ApplicationState::ApplicationState_Wake);
+        return;
+    }
 
     // Stop BLE before deep sleep (defensive - BLE should only run during provisioning)
     if (_bleManager && _bleManager->isInitialized())
@@ -601,7 +795,7 @@ uint64_t ApplicationStateMachine::calculateSleepDurationFrom(time_t now)
         int64_t nextScheduledPostSeconds = -1;
 
         WeeklySchedule schedules[DeviceSettings::MAX_WEEKLY_SCHEDULES];
-        if (_deviceSettings.getWeeklySchedules(schedules))
+        if (!_deviceSettings.getEventPosts() && _deviceSettings.getWeeklySchedules(schedules))
         {
             for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES; ++i)
             {

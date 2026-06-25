@@ -504,7 +504,6 @@ std::string AwsIotClient::createTelemetryJson(const LogiSensorData& data)
     cJSON_AddStringToObject(root, "psch", "00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00, 00:00;00");
     cJSON_AddNumberToObject(root, "fdt", 0);
     cJSON_AddNumberToObject(root, "wto", 0);
-    cJSON_AddNumberToObject(root, "bleadv", 0);
     cJSON_AddNumberToObject(root, "fpd", 0);
     cJSON_AddNumberToObject(root, "pdt", 0);
 
@@ -581,10 +580,6 @@ std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& d
     if (ctx.lteAttemptTimeoutValid)
     {
         cJSON_AddNumberToObject(root, "wto", ctx.lteAttemptTimeout);
-    }
-    if (ctx.bleAdvTimeValid)
-    {
-        cJSON_AddNumberToObject(root, "bleadv", ctx.bleAdvTime);
     }
     if (ctx.sensorSampleRateMinutesValid)
     {

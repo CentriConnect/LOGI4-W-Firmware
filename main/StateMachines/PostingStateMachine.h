@@ -43,6 +43,7 @@ private:
     PostingState currentState = PostingState::PostingState_InitialEnter;
 
     time_t _postStartTime = 0;
+    int64_t _postStartUs = 0;
     time_t _dwellStartTime = 0;     // When post dwell started
     bool _postSuccessful = false;   // Track if posting succeeded for dwell
     int _connectRetryCount = 0;
@@ -56,6 +57,8 @@ private:
     // Gets the connection timeout in seconds (from shadow config, internally renamed from lte_timeout)
     uint32_t getConnectionTimeoutSeconds() const;
     uint32_t getMqttWaterfallTimeoutSeconds() const;
+    bool isPostingTimeoutExpired() const;
+    uint32_t getRemainingPostingBudgetSeconds() const;
 
     // Gets the post dwell time in seconds (from shadow config)
     uint32_t getPostDwellTimeSeconds() const;

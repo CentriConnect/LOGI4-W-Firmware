@@ -14,10 +14,10 @@ const char *DeviceSettings::KEY_FILL_DWELL_T = "FillDwellT";
 const char *DeviceSettings::KEY_LTE_TIMEOUT = "LteTimeout";
 const char *DeviceSettings::KEY_FILL_ALARM_D = "FillAlarmD";
 const char *DeviceSettings::KEY_POST_DWELL_T = "PostDwellT";
-const char *DeviceSettings::KEY_BLE_ADV_T    = "BleAdvT";       // REQ-SHADOW: BLE adv interval (ms)
 const char *DeviceSettings::KEY_EVENT_POSTS = "EventPosts";
 const char *DeviceSettings::KEY_MQTT_SCHED_POST = "MqttSched";
 const char *DeviceSettings::KEY_EVENT_THRESHOLDS = "EvtThresh";
+const char *DeviceSettings::KEY_EVENT_DIRECTION = "EvtDir";
 const char *DeviceSettings::KEY_MQTT_TIMEOUT = "MqttTimeout";
 const char *DeviceSettings::KEY_SENSOR_SAMPLE_RATE = "SampleRate";
 const char *DeviceSettings::KEY_DEVICE_ID_VALID = "DeviceIdValid";
@@ -36,7 +36,6 @@ DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsSer
                                                                     _lteTimeout(0),
                                                                     _fillAlarmDelta(0),
                                                                     _postDwellTime(0),
-                                                                    _bleAdvTime(0),
                                                                     _eventPosts(false),
                                                                     _mqttTimeout(AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S),
                                                                     _sensorSampleRateMin(DEFAULT_SENSOR_SAMPLE_RATE_MIN),
@@ -50,6 +49,7 @@ DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsSer
     memset(_softwareResetStatusStr, 0, sizeof(_softwareResetStatusStr));
     memset(_mqttScheduledPost, 0, sizeof(_mqttScheduledPost));
     memset(_eventThresholdsPct, 0, sizeof(_eventThresholdsPct));
+    memset(_eventDirection, 0, sizeof(_eventDirection));
     memset(_weeklySchedules, 0, sizeof(_weeklySchedules));
 }
 
@@ -101,10 +101,10 @@ bool DeviceSettings::Initialize()
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_LTE_TIMEOUT, _lteTimeout, CONFIG_LOGI_DEFAULT_LTE_TIMEOUT_S);
     success &= loadOrDefaultBasicTypeSetting<uint8_t>(KEY_FILL_ALARM_D, _fillAlarmDelta, CONFIG_LOGI_DEFAULT_FILL_PERCENT_DELTA);
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_POST_DWELL_T, _postDwellTime, CONFIG_LOGI_DEFAULT_POST_DWELL_TIME_S);
-    success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_BLE_ADV_T, _bleAdvTime, CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS);
     success &= loadOrDefaultBasicTypeSetting<bool>(KEY_EVENT_POSTS, _eventPosts, false);
     success &= loadOrDefaultMqttScheduledPost();
     success &= loadOrDefaultEventThresholdsPct();
+    success &= loadOrDefaultEventDirection();
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_MQTT_TIMEOUT, _mqttTimeout, AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S);
     success &= loadOrDefaultBasicTypeSetting<uint32_t>(KEY_SENSOR_SAMPLE_RATE, _sensorSampleRateMin, DEFAULT_SENSOR_SAMPLE_RATE_MIN);
     success &= loadOrDefaultBasicTypeSetting<uint16_t>(KEY_DEVICE_ID_VALID, _deviceIdValidFlag, 0); // Default DeviceId is not valid
@@ -177,10 +177,11 @@ bool DeviceSettings::ApplyDefaults()
     _lteTimeout = CONFIG_LOGI_DEFAULT_LTE_TIMEOUT_S;
     _fillAlarmDelta = CONFIG_LOGI_DEFAULT_FILL_PERCENT_DELTA;
     _postDwellTime = CONFIG_LOGI_DEFAULT_POST_DWELL_TIME_S;
-    _bleAdvTime = CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS;
     _eventPosts = false;
     _mqttScheduledPost[0] = '\0';
     _eventThresholdsPct[0] = '\0';
+    strncpy(_eventDirection, DEFAULT_EVENT_DIRECTION, EVENT_DIRECTION_BUFFER_SIZE - 1);
+    _eventDirection[EVENT_DIRECTION_BUFFER_SIZE - 1] = '\0';
     _mqttTimeout = AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S;
     _sensorSampleRateMin = DEFAULT_SENSOR_SAMPLE_RATE_MIN;
 
@@ -204,10 +205,10 @@ bool DeviceSettings::ApplyDefaults()
     success &= _settingsService.SetValue(KEY_LTE_TIMEOUT, reinterpret_cast<const uint8_t *>(&_lteTimeout), sizeof(_lteTimeout));
     success &= _settingsService.SetValue(KEY_FILL_ALARM_D, reinterpret_cast<const uint8_t *>(&_fillAlarmDelta), sizeof(_fillAlarmDelta));
     success &= _settingsService.SetValue(KEY_POST_DWELL_T, reinterpret_cast<const uint8_t *>(&_postDwellTime), sizeof(_postDwellTime));
-    success &= _settingsService.SetValue(KEY_BLE_ADV_T, reinterpret_cast<const uint8_t *>(&_bleAdvTime), sizeof(_bleAdvTime));
     success &= _settingsService.SetValue(KEY_EVENT_POSTS, _eventPosts);
     success &= _settingsService.SetValue(KEY_MQTT_SCHED_POST, reinterpret_cast<const uint8_t *>(_mqttScheduledPost), strlen(_mqttScheduledPost) + 1);
     success &= _settingsService.SetValue(KEY_EVENT_THRESHOLDS, reinterpret_cast<const uint8_t *>(_eventThresholdsPct), strlen(_eventThresholdsPct) + 1);
+    success &= _settingsService.SetValue(KEY_EVENT_DIRECTION, reinterpret_cast<const uint8_t *>(_eventDirection), strlen(_eventDirection) + 1);
     success &= _settingsService.SetValue(KEY_MQTT_TIMEOUT, reinterpret_cast<const uint8_t *>(&_mqttTimeout), sizeof(_mqttTimeout));
     success &= _settingsService.SetValue(KEY_SENSOR_SAMPLE_RATE, reinterpret_cast<const uint8_t *>(&_sensorSampleRateMin), sizeof(_sensorSampleRateMin));
     success &= _settingsService.SetValue(KEY_DEFAULTS_SET, reinterpret_cast<const uint8_t *>(&_defaultsAppliedFlag), sizeof(_defaultsAppliedFlag));
@@ -394,6 +395,24 @@ bool DeviceSettings::loadOrDefaultEventThresholdsPct()
     return _settingsService.SetValue(KEY_EVENT_THRESHOLDS, reinterpret_cast<const uint8_t *>(_eventThresholdsPct), strlen(_eventThresholdsPct) + 1);
 }
 
+bool DeviceSettings::loadOrDefaultEventDirection()
+{
+    size_t actual_size = _settingsService.GetValue(KEY_EVENT_DIRECTION, reinterpret_cast<uint8_t *>(_eventDirection), EVENT_DIRECTION_BUFFER_SIZE);
+    if (actual_size > 0 && actual_size <= EVENT_DIRECTION_BUFFER_SIZE)
+    {
+        _eventDirection[EVENT_DIRECTION_BUFFER_SIZE - 1] = '\0';
+        if (strcmp(_eventDirection, "up") == 0 || strcmp(_eventDirection, "down") == 0)
+        {
+            return true;
+        }
+    }
+
+    ESP_LOGW(TAG, "Setting '%s' not found/invalid in NVS. Applying default.", KEY_EVENT_DIRECTION);
+    strncpy(_eventDirection, DEFAULT_EVENT_DIRECTION, EVENT_DIRECTION_BUFFER_SIZE - 1);
+    _eventDirection[EVENT_DIRECTION_BUFFER_SIZE - 1] = '\0';
+    return _settingsService.SetValue(KEY_EVENT_DIRECTION, reinterpret_cast<const uint8_t *>(_eventDirection), strlen(_eventDirection) + 1);
+}
+
 // --- Getters ---
 
 bool DeviceSettings::getDeviceId(char *buffer, size_t bufferSize) const
@@ -455,8 +474,15 @@ uint32_t DeviceSettings::getFillDwellTime() const
 uint32_t DeviceSettings::getLteTimeout() const
 {
     if (!_initialized)
-        return CONFIG_LOGI_DEFAULT_LTE_TIMEOUT_S;
-    return _lteTimeout;
+    {
+        uint32_t minimum = AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S * 3U;
+        return (CONFIG_LOGI_DEFAULT_LTE_TIMEOUT_S < minimum)
+            ? minimum
+            : CONFIG_LOGI_DEFAULT_LTE_TIMEOUT_S;
+    }
+
+    uint32_t minimum = getMinimumWifiTimeoutSeconds();
+    return (_lteTimeout < minimum) ? minimum : _lteTimeout;
 }
 
 uint8_t DeviceSettings::getFillAlarmDelta() const
@@ -500,6 +526,16 @@ bool DeviceSettings::getEventThresholdsPct(char *buffer, size_t bufferSize) cons
     return true;
 }
 
+bool DeviceSettings::getEventDirection(char *buffer, size_t bufferSize) const
+{
+    if (!_initialized || buffer == nullptr || bufferSize == 0)
+        return false;
+
+    strncpy(buffer, _eventDirection, bufferSize);
+    buffer[bufferSize - 1] = '\0';
+    return true;
+}
+
 uint32_t DeviceSettings::getMqttTimeout() const
 {
     if (!_initialized)
@@ -507,6 +543,17 @@ uint32_t DeviceSettings::getMqttTimeout() const
     return (_mqttTimeout < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
         ? AWS_IOT_MIN_WATERFALL_TIMEOUT_S
         : _mqttTimeout;
+}
+
+uint32_t DeviceSettings::getMinimumWifiTimeoutSeconds() const
+{
+    uint32_t mqttTimeout = getMqttTimeout();
+    uint32_t minimum = mqttTimeout * 3U;
+    if (minimum < CONFIG_LOGI_MIN_LTE_TIMEOUT_S)
+    {
+        minimum = CONFIG_LOGI_MIN_LTE_TIMEOUT_S;
+    }
+    return minimum;
 }
 
 uint32_t DeviceSettings::getSensorSampleRateMinutes() const
@@ -635,6 +682,16 @@ bool DeviceSettings::setLteTimeout(uint32_t seconds)
 {
     if (!_initialized)
         return false;
+
+    uint32_t minimum = getMinimumWifiTimeoutSeconds();
+    if (seconds < minimum)
+    {
+        ESP_LOGW(TAG, "wifi_timeout %lu below effective min %lu (3x mqtt_timeout); clamping",
+                 static_cast<unsigned long>(seconds),
+                 static_cast<unsigned long>(minimum));
+        seconds = minimum;
+    }
+
     ESP_LOGI(TAG, "Setting LTE Timeout to: %lu seconds", seconds);
     _lteTimeout = seconds;
     // --- Save as blob ---
@@ -672,31 +729,6 @@ bool DeviceSettings::setPostDwellTime(uint32_t seconds)
     // --- End Save ---
     if (!success)
         ESP_LOGE(TAG, "Failed to save Post Dwell Time!");
-    return success;
-}
-
-uint32_t DeviceSettings::getBleAdvTime() const
-{
-    if (!_initialized) {
-        ESP_LOGW(TAG, "Not initialized, returning default ble_adv_time");
-        return CONFIG_LOGI_DEFAULT_BLE_ADV_TIME_MS;
-    }
-    return _bleAdvTime;
-}
-
-bool DeviceSettings::setBleAdvTime(uint32_t milliseconds)
-{
-    if (!_initialized)
-        return false;
-    if (milliseconds < CONFIG_LOGI_MIN_BLE_ADV_TIME_MS) {
-        ESP_LOGW(TAG, "ble_adv_time %lu ms below min %d ms — rejected", milliseconds, CONFIG_LOGI_MIN_BLE_ADV_TIME_MS);
-        return false;
-    }
-    ESP_LOGI(TAG, "Setting BLE ADV Time to: %lu ms", milliseconds);
-    _bleAdvTime = milliseconds;
-    bool success = _settingsService.SetValue(KEY_BLE_ADV_T, reinterpret_cast<const uint8_t *>(&_bleAdvTime), sizeof(_bleAdvTime));
-    if (!success)
-        ESP_LOGE(TAG, "Failed to save BLE ADV Time!");
     return success;
 }
 
@@ -750,6 +782,33 @@ bool DeviceSettings::setEventThresholdsPct(const char *thresholds)
     return success;
 }
 
+bool DeviceSettings::setEventDirection(const char *direction)
+{
+    if (!_initialized)
+        return false;
+
+    const char *normalized = DEFAULT_EVENT_DIRECTION;
+    if (direction != nullptr && strcmp(direction, "up") == 0)
+    {
+        normalized = "up";
+    }
+    else if (direction != nullptr && strcmp(direction, "down") != 0)
+    {
+        ESP_LOGW(TAG, "Invalid event_direction '%s'; defaulting to down", direction);
+    }
+
+    ESP_LOGI(TAG, "Setting event_direction to: %s", normalized);
+    strncpy(_eventDirection, normalized, EVENT_DIRECTION_BUFFER_SIZE - 1);
+    _eventDirection[EVENT_DIRECTION_BUFFER_SIZE - 1] = '\0';
+
+    bool success = _settingsService.SetValue(KEY_EVENT_DIRECTION,
+                                             reinterpret_cast<const uint8_t *>(_eventDirection),
+                                             strlen(_eventDirection) + 1);
+    if (!success)
+        ESP_LOGE(TAG, "Failed to save event_direction!");
+    return success;
+}
+
 bool DeviceSettings::setMqttTimeout(uint32_t seconds)
 {
     if (!_initialized)
@@ -770,6 +829,24 @@ bool DeviceSettings::setMqttTimeout(uint32_t seconds)
                                              sizeof(_mqttTimeout));
     if (!success)
         ESP_LOGE(TAG, "Failed to save mqtt_timeout!");
+
+    uint32_t minimumWifiTimeout = getMinimumWifiTimeoutSeconds();
+    if (_lteTimeout < minimumWifiTimeout)
+    {
+        ESP_LOGW(TAG, "Existing wifi_timeout %lu below effective min %lu after mqtt_timeout update; clamping",
+                 static_cast<unsigned long>(_lteTimeout),
+                 static_cast<unsigned long>(minimumWifiTimeout));
+        _lteTimeout = minimumWifiTimeout;
+        bool wifiSuccess = _settingsService.SetValue(KEY_LTE_TIMEOUT,
+                                                     reinterpret_cast<const uint8_t *>(&_lteTimeout),
+                                                     sizeof(_lteTimeout));
+        if (!wifiSuccess)
+        {
+            ESP_LOGE(TAG, "Failed to save clamped wifi_timeout!");
+        }
+        success = success && wifiSuccess;
+    }
+
     return success;
 }
 

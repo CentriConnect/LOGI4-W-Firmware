@@ -121,6 +121,15 @@ private:
     // Provisioning helpers
     void enterProvisioningMode(ProvisioningMode mode);
     bool checkForceProvisioningFlag();
+    void onRepairBleConnection();
+    void startWifiRepairAdvertisingIfDue(time_t now);
+    void stopWifiRepairAdvertising();
+    void waitAwakeWithRepairAdvertising(uint64_t durationUs);
+    void resetDutyCycleStateMachines();
+    void markWifiOutageStarted(time_t now);
+    void clearWifiOutage();
+    bool isWifiOutageRepairDue(time_t now) const;
+    void buildBleServiceName(char *serviceName, size_t maxLen) const;
 };
 
 #endif // APPLICATION_STATE_MACHINE_H

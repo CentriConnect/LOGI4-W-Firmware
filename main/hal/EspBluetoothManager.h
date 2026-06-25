@@ -24,7 +24,7 @@ public:
     void deinit();
 
     /// Start advertising with a device name (safe to call before host sync; it will defer)
-    bool startAdvertising(const char* name);
+    bool startAdvertising(const char* name, uint32_t intervalMs = 1000);
 
     /// Stop advertising (no-op if not advertising)
     void stopAdvertising();
@@ -74,6 +74,7 @@ private:
 
     // Requested name to use for ADV when ready
     char _advName[32] = "Autient-ESP";
+    uint32_t _advIntervalMs = 1000;
 
     // Own address type chosen at runtime
     uint8_t _ownAddrType = 0;

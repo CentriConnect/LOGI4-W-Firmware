@@ -61,7 +61,6 @@ struct TelemetryContext
     uint8_t fillPostDeltaValue;
     uint32_t lteAttemptTimeout;
     uint32_t postDwellTime;
-    uint32_t bleAdvTime;
     uint32_t sensorSampleRateMinutes;
     char mqttPort[8];
     char mqttScheduledPost[16];
@@ -86,7 +85,6 @@ struct TelemetryContext
     bool fillPostDeltaValueValid;
     bool lteAttemptTimeoutValid;
     bool postDwellTimeValid;
-    bool bleAdvTimeValid;
     bool sensorSampleRateMinutesValid;
     bool mqttPortValid;
     bool mqttScheduledPostValid;

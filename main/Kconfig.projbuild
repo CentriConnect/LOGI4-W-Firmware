@@ -15,11 +15,11 @@ menu "Featured FreeRTOS IoT Integration"
 
             config LOGI_DEFAULT_LTE_TIMEOUT_S
                 int "Wake mode timeout before returning to sleep when prompted to send data in seconds."
-                default 300
+                default 360
 
             config LOGI_MIN_LTE_TIMEOUT_S
                 int "Wake mode timeout before returning to sleep when prompted to send data in seconds."
-                default 300
+                default 15
 
             config LOGI_DEFAULT_FILL_PERCENT_DELTA
                 int "The fuel level increase, in percent, that must occur to trigger a 'fill' event."
@@ -36,18 +36,6 @@ menu "Featured FreeRTOS IoT Integration"
             config LOGI_MIN_FILL_DWELL_TIME_S
                 int "The minimum time, in seconds, that the fuel level must remain above the fill threshold to trigger a 'fill' event."
                 default 300
-
-            config LOGI_DEFAULT_BLE_ADV_TIME_MS
-                int "Default BLE ADV interval during prov mode (ms)"
-                default 8000
-                help
-                    REQ-SHADOW: BLE advertising interval (ms) used during the 48h
-                    provisioning window. Shadow-controllable via 'ble_adv_time'.
-                    LOGI4W cloud payloads commonly use values such as 120.
-
-            config LOGI_MIN_BLE_ADV_TIME_MS
-                int "Minimum BLE ADV interval (ms) — shadow values below this are rejected"
-                default 1
 
             config LOGI_DEFAULT_POST_DWELL_TIME_S
                 int "The minimum time, in seconds, that the fuel level must remain above the fill threshold to trigger a 'fill' event."

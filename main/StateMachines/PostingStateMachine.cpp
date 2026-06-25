@@ -13,6 +13,7 @@
 #include "logi/Faults.h"
 #include "UDP/UdpTelemetryClient.h"
 #include <cstdio>
+#include <algorithm>
 
 static const char *TAG = "PostingStateMachine";
 
@@ -32,15 +33,12 @@ PostingStateMachine::PostingStateMachine(AwsIotManager* awsIotManager, EspTimeKe
 
 void PostingStateMachine::update()
 {
-    // Check connection timeout (uses configurable value from shadow, internally renamed from lte_timeout)
-    uint32_t connectionTimeout = getConnectionTimeoutSeconds();
-    if (currentState == PostingState::PostingState_TryConnect)
+    if (currentState != PostingState::PostingState_InitialEnter &&
+        currentState != PostingState::PostingState_ExitAWS &&
+        isPostingTimeoutExpired())
     {
-        connectionTimeout = (getMqttWaterfallTimeoutSeconds() * 2U) + 30U;
-    }
-    if (_postStartTime != 0 && (_timeKeeper->GetCurrentTime() - _postStartTime) > connectionTimeout)
-    {
-        ESP_LOGE(TAG, "Posting process timed out after %lu seconds!", (unsigned long)connectionTimeout);
+        ESP_LOGE(TAG, "Posting process timed out after wifi_timeout=%lu seconds; exiting to sleep",
+                 static_cast<unsigned long>(getConnectionTimeoutSeconds()));
         transitionTo(PostingState::PostingState_ExitAWS);
     }
 
@@ -247,20 +245,17 @@ void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& s
     if (shadowState.fill_dwell_time != 0) {
         _deviceSettings.setFillDwellTime(shadowState.fill_dwell_time);
     }
-    if (shadowState.lte_timeout != 0) {
-        _deviceSettings.setLteTimeout(shadowState.lte_timeout);
-    }
     if (shadowState.fill_alarm_delta != 0) {
         _deviceSettings.setFillAlarmDelta(shadowState.fill_alarm_delta);
     }
     if (shadowState.post_dwell_time != 0) {
         _deviceSettings.setPostDwellTime(shadowState.post_dwell_time);
     }
-    if (shadowState.ble_adv_time != 0) {
-        _deviceSettings.setBleAdvTime(shadowState.ble_adv_time);
-    }
     if (shadowState.mqtt_timeout != 0) {
         _deviceSettings.setMqttTimeout(shadowState.mqtt_timeout);
+    }
+    if (shadowState.lte_timeout != 0) {
+        _deviceSettings.setLteTimeout(shadowState.lte_timeout);
     }
     if (shadowState.sensor_sample_rate != 0) {
         _deviceSettings.setSensorSampleRateMinutes(shadowState.sensor_sample_rate);
@@ -270,6 +265,9 @@ void PostingStateMachine::applyShadowSettingsToMemory(const DeviceShadowState& s
     }
     if (!shadowState.event_thresholds_pct.empty()) {
         _deviceSettings.setEventThresholdsPct(shadowState.event_thresholds_pct.c_str());
+    }
+    if (!shadowState.event_direction.empty()) {
+        _deviceSettings.setEventDirection(shadowState.event_direction.c_str());
     }
     if (!shadowState.mqtt_scheduled_post.empty()) {
         _deviceSettings.setMqttScheduledPost(shadowState.mqtt_scheduled_post.c_str());
@@ -311,8 +309,6 @@ DeviceShadowState PostingStateMachine::buildReportedShadowFromSettings(const Dev
     reported.lte_timeout = _deviceSettings.getLteTimeout();
     reported.fill_alarm_delta = _deviceSettings.getFillAlarmDelta();
     reported.post_dwell_time = _deviceSettings.getPostDwellTime();
-    reported.ble_adv_time = _deviceSettings.getBleAdvTime();
-
     char mqttScheduledPost[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
     if (_deviceSettings.getMqttScheduledPost(mqttScheduledPost, sizeof(mqttScheduledPost)))
     {
@@ -324,6 +320,11 @@ DeviceShadowState PostingStateMachine::buildReportedShadowFromSettings(const Dev
     if (_deviceSettings.getEventThresholdsPct(eventThresholds, sizeof(eventThresholds)))
     {
         reported.event_thresholds_pct = eventThresholds;
+    }
+    char eventDirection[DeviceSettings::EVENT_DIRECTION_BUFFER_SIZE] = {0};
+    if (_deviceSettings.getEventDirection(eventDirection, sizeof(eventDirection)))
+    {
+        reported.event_direction = eventDirection;
     }
 
     reported.sensor_sample_rate = _deviceSettings.getSensorSampleRateMinutes();
@@ -350,6 +351,7 @@ void PostingStateMachine::PostingStateInitialEnter()
 
     // Record start time (may be invalid if not synced yet, will update after WiFi connects)
     _postStartTime = _timeKeeper->GetCurrentTime();
+    _postStartUs = esp_timer_get_time();
     ESP_LOGI(TAG, "Starting post timer. Start time: %ld (may update after NTP sync)", (long int)_postStartTime);
 
     if (!_parentStateMachine || !_parentStateMachine->checkAndConnectWifi())
@@ -411,6 +413,16 @@ void PostingStateMachine::PostingStateTryConnect()
 {   
     ESP_LOGI(TAG, "Attempting AWS IoT MQTT waterfall");
 
+    uint32_t remainingBudget = getRemainingPostingBudgetSeconds();
+    if (remainingBudget < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+    {
+        ESP_LOGW(TAG, "Remaining wifi_timeout budget too small for MQTT waterfall (%lu s); using UDP fallback/exit",
+                 static_cast<unsigned long>(remainingBudget));
+        Faults_Set(FAULT_AWS);
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
+        return;
+    }
+
     if (!_timeKeeper->IsTimeSynced())
     {
         ESP_LOGI(TAG, "Synchronizing UTC time via NTP before AWS IoT TLS/MQTT connect...");
@@ -439,7 +451,25 @@ void PostingStateMachine::PostingStateTryConnect()
         }
     }
     
-    if (_awsIotManager->ConnectWithWaterfall(getMqttWaterfallTimeoutSeconds()))
+    remainingBudget = getRemainingPostingBudgetSeconds();
+    uint32_t mqttTimeout = getMqttWaterfallTimeoutSeconds();
+    uint32_t perLegTimeout = mqttTimeout;
+    if (remainingBudget > 30U)
+    {
+        perLegTimeout = std::min(mqttTimeout, (remainingBudget - 30U) / 2U);
+    }
+    if (perLegTimeout < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
+    {
+        ESP_LOGW(TAG, "Remaining wifi_timeout budget too small for MQTT waterfall after NTP (%lu s); using UDP fallback/exit",
+                 static_cast<unsigned long>(remainingBudget));
+        Faults_Set(FAULT_AWS);
+        transitionTo(PostingState::PostingState_DoPostsFromQueue);
+        return;
+    }
+
+    ESP_LOGI(TAG, "MQTT waterfall per-leg timeout capped at %lu seconds by wifi_timeout budget",
+             static_cast<unsigned long>(perLegTimeout));
+    if (_awsIotManager->ConnectWithWaterfall(perLegTimeout))
     {
         ESP_LOGI(TAG, "Connection successful.");
         _connectRetryCount = 0;  // Reset retry counter on success
@@ -942,6 +972,35 @@ uint32_t PostingStateMachine::getConnectionTimeoutSeconds() const
     return timeout;
 }
 
+bool PostingStateMachine::isPostingTimeoutExpired() const
+{
+    if (_postStartUs <= 0)
+    {
+        return false;
+    }
+
+    const int64_t elapsedUs = esp_timer_get_time() - _postStartUs;
+    const int64_t timeoutUs = static_cast<int64_t>(getConnectionTimeoutSeconds()) * 1000000LL;
+    return elapsedUs >= timeoutUs;
+}
+
+uint32_t PostingStateMachine::getRemainingPostingBudgetSeconds() const
+{
+    if (_postStartUs <= 0)
+    {
+        return getConnectionTimeoutSeconds();
+    }
+
+    const int64_t elapsedUs = esp_timer_get_time() - _postStartUs;
+    const int64_t timeoutUs = static_cast<int64_t>(getConnectionTimeoutSeconds()) * 1000000LL;
+    if (elapsedUs >= timeoutUs)
+    {
+        return 0;
+    }
+
+    return static_cast<uint32_t>((timeoutUs - elapsedUs + 999999LL) / 1000000LL);
+}
+
 uint32_t PostingStateMachine::getMqttWaterfallTimeoutSeconds() const
 {
     uint32_t timeout = _deviceSettings.getMqttTimeout();
@@ -1094,10 +1153,6 @@ void PostingStateMachine::populateTelemetryContext(TelemetryContext& ctx) const
     // Post dwell time
     ctx.postDwellTime = _deviceSettings.getPostDwellTime();
     ctx.postDwellTimeValid = true;
-
-    // BLE advertising interval
-    ctx.bleAdvTime = _deviceSettings.getBleAdvTime();
-    ctx.bleAdvTimeValid = true;
 
     // Sensor sample rate in minutes
     ctx.sensorSampleRateMinutes = _deviceSettings.getSensorSampleRateMinutes();

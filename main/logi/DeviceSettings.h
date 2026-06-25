@@ -21,8 +21,10 @@ public:
     static const size_t SW_RESET_STATUS_BUFFER_SIZE = 20;
     static const size_t MQTT_SCHEDULED_POST_BUFFER_SIZE = 16;
     static const size_t EVENT_THRESHOLDS_BUFFER_SIZE = 128;
+    static const size_t EVENT_DIRECTION_BUFFER_SIZE = 8;
+    static constexpr const char *DEFAULT_EVENT_DIRECTION = "down";
     static constexpr uint32_t DEFAULT_SENSOR_SAMPLE_RATE_MIN = 3;
-    static constexpr uint32_t MIN_SENSOR_SAMPLE_RATE_MIN = 3;
+    static constexpr uint32_t MIN_SENSOR_SAMPLE_RATE_MIN = 1;
     static constexpr uint32_t MAX_SENSOR_SAMPLE_RATE_MIN = 1440;
     static const uint16_t DEVICE_ID_VALID_FLAG_VALUE = 0xBAFD;
 // Use the Kconfig value for the defaults applied flag
@@ -133,16 +135,13 @@ public:
      */
     uint32_t getPostDwellTime() const;
 
-    /**
-     * @brief Gets the BLE ADV interval (ms) used during the 48h provisioning window.
-     * REQ-SHADOW: REV B field 'ble_adv_time', min 1000 ms, default 8000 ms.
-     */
-    uint32_t getBleAdvTime() const;
     bool getEventPosts() const;
     bool getMqttScheduledPost(char *buffer, size_t bufferSize) const;
     bool getEventThresholdsPct(char *buffer, size_t bufferSize) const;
+    bool getEventDirection(char *buffer, size_t bufferSize) const;
     uint32_t getMqttTimeout() const;
     uint32_t getSensorSampleRateMinutes() const;
+    uint32_t getMinimumWifiTimeoutSeconds() const;
 
     /**
      * @brief Checks if the stored Device ID is considered valid based on the flag.
@@ -200,14 +199,10 @@ public:
      */
     bool setPostDwellTime(uint32_t seconds);
 
-    /**
-     * @brief Sets the BLE ADV interval (ms). REQ-SHADOW.
-     * Values below CONFIG_LOGI_MIN_BLE_ADV_TIME_MS are rejected.
-     */
-    bool setBleAdvTime(uint32_t milliseconds);
     bool setEventPosts(bool enabled);
     bool setMqttScheduledPost(const char *schedule);
     bool setEventThresholdsPct(const char *thresholds);
+    bool setEventDirection(const char *direction);
     bool setMqttTimeout(uint32_t seconds);
     bool setSensorSampleRateMinutes(uint32_t minutes);
 
@@ -224,10 +219,10 @@ private:
     uint32_t _lteTimeout;
     uint8_t _fillAlarmDelta;
     uint32_t _postDwellTime;
-    uint32_t _bleAdvTime;       // REQ-SHADOW: BLE adv interval (ms) for prov mode
     bool _eventPosts;
     char _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE];
     char _eventThresholdsPct[EVENT_THRESHOLDS_BUFFER_SIZE];
+    char _eventDirection[EVENT_DIRECTION_BUFFER_SIZE];
     uint32_t _mqttTimeout;
     uint32_t _sensorSampleRateMin;
     uint16_t _deviceIdValidFlag;
@@ -241,10 +236,10 @@ private:
     static const char *KEY_LTE_TIMEOUT;
     static const char *KEY_FILL_ALARM_D;
     static const char *KEY_POST_DWELL_T;
-    static const char *KEY_BLE_ADV_T;       // REQ-SHADOW
     static const char *KEY_EVENT_POSTS;
     static const char *KEY_MQTT_SCHED_POST;
     static const char *KEY_EVENT_THRESHOLDS;
+    static const char *KEY_EVENT_DIRECTION;
     static const char *KEY_MQTT_TIMEOUT;
     static const char *KEY_SENSOR_SAMPLE_RATE;
     static const char *KEY_DEVICE_ID_VALID;
@@ -290,6 +285,7 @@ private:
     bool loadOrDefaultWeeklySchedules();
     bool loadOrDefaultMqttScheduledPost();
     bool loadOrDefaultEventThresholdsPct();
+    bool loadOrDefaultEventDirection();
 
     /**
      * @brief Converts the internal _softwareResetStatusStr to the enum value.

@@ -9,6 +9,7 @@
 #include "logi/Faults.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 static const char *TAG = "ScheduleCheckStateMachine";
 
@@ -24,6 +25,11 @@ static constexpr float BATTERY_POST_THRESHOLD_V = static_cast<float>(CONFIG_LOGI
 
 // Counter for minutes when we don't have valid time (also persisted across sleep)
 RTC_DATA_ATTR static uint32_t minutes_since_last_post = 0;
+RTC_DATA_ATTR static uint32_t event_threshold_latch_mask = 0;
+RTC_DATA_ATTR static char event_threshold_latch_config[DeviceSettings::EVENT_THRESHOLDS_BUFFER_SIZE] = {0};
+RTC_DATA_ATTR static char event_threshold_latch_direction[DeviceSettings::EVENT_DIRECTION_BUFFER_SIZE] = {0};
+
+static constexpr size_t MAX_EVENT_THRESHOLDS = 16;
 
 static bool parseShadowScheduleString(const char* schedule, int& hour, int& minute, uint8_t& daysOfWeek)
 {
@@ -45,6 +51,46 @@ static bool parseShadowScheduleString(const char* schedule, int& hour, int& minu
 
     daysOfWeek = static_cast<uint8_t>(dayByte & 0x7F);
     return true;
+}
+
+static int parseEventThresholds(const char* thresholdString, float thresholds[MAX_EVENT_THRESHOLDS])
+{
+    if (thresholdString == nullptr || thresholdString[0] == '\0')
+    {
+        return 0;
+    }
+
+    int count = 0;
+    const char* cursor = thresholdString;
+    while (*cursor != '\0' && count < static_cast<int>(MAX_EVENT_THRESHOLDS))
+    {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ',')
+        {
+            ++cursor;
+        }
+
+        if (*cursor == '\0')
+        {
+            break;
+        }
+
+        char* end = nullptr;
+        float threshold = strtof(cursor, &end);
+        if (end == cursor)
+        {
+            break;
+        }
+
+        thresholds[count++] = threshold;
+
+        cursor = end;
+        while (*cursor != '\0' && *cursor != ',')
+        {
+            ++cursor;
+        }
+    }
+
+    return count;
 }
 
 ScheduleCheckStateMachine::ScheduleCheckStateMachine(EspTimeKeeper* timeKeeper, const DeviceSettings& deviceSettings, EspNetworkManager* networkManager, LogiSensorData& sensorData): 
@@ -202,6 +248,7 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
     int mqttHour = 0;
     int mqttMinute = 0;
     uint8_t mqttDays = 0;
+    const bool eventPostsEnabled = _deviceSettings.getEventPosts();
     bool hasMqttSchedule = _deviceSettings.getMqttScheduledPost(mqttSchedule, sizeof(mqttSchedule)) &&
                            parseShadowScheduleString(mqttSchedule, mqttHour, mqttMinute, mqttDays);
 
@@ -234,7 +281,21 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
         }
     }
 
-    for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES && !withinScheduledWindow; ++i)
+    if (eventPostsEnabled && noPostInLastFiveMinutes && !withinScheduledWindow)
+    {
+        float ratioPct = 0.0f;
+        float crossedThreshold = 0.0f;
+        if (evaluateEventThresholdPost(ratioPct, crossedThreshold))
+        {
+            ESP_LOGI(TAG, "Event post due: raw/supv ratio %.2f%% crossed %.2f%%; queueing compact UDP.",
+                     ratioPct,
+                     crossedThreshold);
+            withinScheduledWindow = true;
+            selectedTransport = PostTransport::PostTransport_Udp;
+        }
+    }
+
+    for (int i = 0; i < DeviceSettings::MAX_WEEKLY_SCHEDULES && !withinScheduledWindow && !eventPostsEnabled; ++i)
     {
         if (schedules[i].DaysOfWeek == 0) continue;
 
@@ -301,7 +362,14 @@ void ScheduleCheckStateMachine::ScheduleCheckStateCompareTimeToScheduledTime()
         }
         if (!withinScheduledWindow)
         {
-            ESP_LOGI(TAG, "Cannot post: not on a scheduled minute");
+            if (eventPostsEnabled)
+            {
+                ESP_LOGI(TAG, "Cannot post: no MQTT heartbeat minute or unlatched event threshold");
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Cannot post: not on a scheduled minute");
+            }
         }
 
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
@@ -371,4 +439,104 @@ void ScheduleCheckStateMachine::update_last_post_time(int64_t current_time)
     last_post_attempt = current_time;
     has_valid_time = true;
     minutes_since_last_post = 0;  // Reset minute counter on any post
+}
+
+bool ScheduleCheckStateMachine::evaluateEventThresholdPost(float& ratioPct, float& crossedThreshold)
+{
+    ratioPct = 0.0f;
+    crossedThreshold = 0.0f;
+
+    if (!_deviceSettings.getEventPosts())
+    {
+        return false;
+    }
+
+    char thresholdString[DeviceSettings::EVENT_THRESHOLDS_BUFFER_SIZE] = {0};
+    if (!_deviceSettings.getEventThresholdsPct(thresholdString, sizeof(thresholdString)) ||
+        thresholdString[0] == '\0')
+    {
+        ESP_LOGW(TAG, "event_posts enabled but event_thresholds_pct is empty");
+        return false;
+    }
+
+    char eventDirection[DeviceSettings::EVENT_DIRECTION_BUFFER_SIZE] = {0};
+    if (!_deviceSettings.getEventDirection(eventDirection, sizeof(eventDirection)) ||
+        (strcmp(eventDirection, "up") != 0 && strcmp(eventDirection, "down") != 0))
+    {
+        strncpy(eventDirection, DeviceSettings::DEFAULT_EVENT_DIRECTION, sizeof(eventDirection) - 1);
+        eventDirection[sizeof(eventDirection) - 1] = '\0';
+    }
+
+    if (strncmp(event_threshold_latch_config, thresholdString, sizeof(event_threshold_latch_config)) != 0 ||
+        strncmp(event_threshold_latch_direction, eventDirection, sizeof(event_threshold_latch_direction)) != 0)
+    {
+        strncpy(event_threshold_latch_config, thresholdString, sizeof(event_threshold_latch_config) - 1);
+        event_threshold_latch_config[sizeof(event_threshold_latch_config) - 1] = '\0';
+        strncpy(event_threshold_latch_direction, eventDirection, sizeof(event_threshold_latch_direction) - 1);
+        event_threshold_latch_direction[sizeof(event_threshold_latch_direction) - 1] = '\0';
+        event_threshold_latch_mask = 0;
+        ESP_LOGI(TAG, "Event threshold config changed; latches reset (%s, direction=%s)",
+                 event_threshold_latch_config,
+                 event_threshold_latch_direction);
+    }
+
+    if (_sensorData.SensorSupplyVoltage <= 0.0f || _sensorData.AnalogFuelVoltage < 0.0f)
+    {
+        ESP_LOGW(TAG, "Cannot evaluate event threshold: raw=%.3f supv=%.3f",
+                 _sensorData.AnalogFuelVoltage,
+                 _sensorData.SensorSupplyVoltage);
+        return false;
+    }
+
+    ratioPct = (_sensorData.AnalogFuelVoltage / _sensorData.SensorSupplyVoltage) * 100.0f;
+
+    float thresholds[MAX_EVENT_THRESHOLDS] = {0};
+    const int count = parseEventThresholds(thresholdString, thresholds);
+    if (count <= 0)
+    {
+        ESP_LOGW(TAG, "event_posts enabled but no valid thresholds parsed from '%s'", thresholdString);
+        return false;
+    }
+
+    bool shouldPost = false;
+    const bool directionUp = (strcmp(eventDirection, "up") == 0);
+    const float resetDelta = static_cast<float>(_deviceSettings.getFillAlarmDelta());
+    for (int i = 0; i < count; ++i)
+    {
+        const uint32_t bit = (1UL << i);
+        const bool isLatched = (event_threshold_latch_mask & bit) != 0;
+
+        if (isLatched)
+        {
+            const bool resetLatch = directionUp
+                ? (ratioPct <= (thresholds[i] - resetDelta))
+                : (ratioPct >= (thresholds[i] + resetDelta));
+
+            if (resetLatch)
+            {
+                event_threshold_latch_mask &= ~bit;
+                ESP_LOGI(TAG, "Event threshold re-armed: ratio %.2f%% moved %s %.2f%% by delta %.2f%%",
+                         ratioPct,
+                         directionUp ? "below" : "above",
+                         thresholds[i],
+                         resetDelta);
+            }
+        }
+
+        if ((event_threshold_latch_mask & bit) == 0 &&
+            ((directionUp && ratioPct >= thresholds[i]) ||
+             (!directionUp && ratioPct <= thresholds[i])))
+        {
+            event_threshold_latch_mask |= bit;
+            crossedThreshold = thresholds[i];
+            shouldPost = true;
+            ESP_LOGI(TAG, "Event threshold crossed: ratio %.2f%% %s %.2f%% (index %d)",
+                     ratioPct,
+                     directionUp ? ">=" : "<=",
+                     thresholds[i],
+                     i);
+        }
+    }
+
+    return shouldPost;
 }

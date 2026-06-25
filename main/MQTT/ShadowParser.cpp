@@ -14,13 +14,12 @@ static const char* TAG = "ShadowParser";
 // minimum are rejected (logged WARN, previous value preserved). 0 means
 // "field not set, do not apply" — used for delta detection elsewhere.
 static constexpr uint32_t MIN_FILL_DWELL_TIME_S   = 300;
-static constexpr uint32_t MIN_WIFI_TIMEOUT_S      = 300;
+static constexpr uint32_t MIN_WIFI_TIMEOUT_S      = 15;
 static constexpr uint8_t  MIN_FILL_ALARM_DELTA    = 10;
 static constexpr uint32_t MIN_POST_DWELL_TIME_S   = 60;
-static constexpr uint32_t MIN_BLE_ADV_TIME_MS     = 1;
 static constexpr uint32_t MIN_MQTT_TIMEOUT_S      = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;
 static constexpr uint32_t DEFAULT_SENSOR_SAMPLE_RATE_MIN = 3;
-static constexpr uint32_t MIN_SENSOR_SAMPLE_RATE_MIN = 3;
+static constexpr uint32_t MIN_SENSOR_SAMPLE_RATE_MIN = 1;
 static constexpr uint32_t MAX_SENSOR_SAMPLE_RATE_MIN = 1440;
 
 static std::string trimCopy(const std::string& value)
@@ -149,14 +148,6 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
             else { stateOut.post_dwell_time = v; success = true; }
         }
 
-        // REQ-SHADOW: ble_adv_time (REV B). Units: ms. Min 1000, default 8000.
-        item = cJSON_GetObjectItem(config, "ble_adv_time");
-        if (item && cJSON_IsNumber(item)) {
-            uint32_t v = (uint32_t)item->valueint;
-            if (v < MIN_BLE_ADV_TIME_MS) { ESP_LOGW(TAG, "ble_adv_time %u below min %u ms — rejected", (unsigned)v, (unsigned)MIN_BLE_ADV_TIME_MS); }
-            else { stateOut.ble_adv_time = v; success = true; }
-        }
-
         item = cJSON_GetObjectItem(config, "mqtt_scheduled_post");
         if (item && cJSON_IsString(item) && item->valuestring != NULL) {
             stateOut.mqtt_scheduled_post = trimCopy(item->valuestring);
@@ -173,6 +164,17 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
         item = cJSON_GetObjectItem(config, "event_thresholds_pct");
         if (item && cJSON_IsString(item) && item->valuestring != NULL) {
             stateOut.event_thresholds_pct = trimCopy(item->valuestring);
+            success = true;
+        }
+
+        item = cJSON_GetObjectItem(config, "event_direction");
+        if (item && cJSON_IsString(item) && item->valuestring != NULL) {
+            std::string direction = trimCopy(item->valuestring);
+            if (direction != "up" && direction != "down") {
+                ESP_LOGW(TAG, "event_direction '%s' invalid; defaulting to down", direction.c_str());
+                direction = "down";
+            }
+            stateOut.event_direction = direction;
             success = true;
         }
 
@@ -236,10 +238,10 @@ std::string CreateEnhancedShadowUpdate(const DeviceShadowState& state, const Log
     cJSON_AddNumberToObject(reported, "wifi_timeout", state.lte_timeout);
     cJSON_AddNumberToObject(reported, "fill_alarm_delta", state.fill_alarm_delta);
     cJSON_AddNumberToObject(reported, "post_dwell_time", state.post_dwell_time);
-    cJSON_AddNumberToObject(reported, "ble_adv_time", state.ble_adv_time);
     if (!state.mqtt_scheduled_post.empty()) cJSON_AddStringToObject(reported, "mqtt_scheduled_post", state.mqtt_scheduled_post.c_str());
     if (state.event_posts_valid) cJSON_AddBoolToObject(reported, "event_posts", state.event_posts);
     if (!state.event_thresholds_pct.empty()) cJSON_AddStringToObject(reported, "event_thresholds_pct", state.event_thresholds_pct.c_str());
+    if (!state.event_direction.empty()) cJSON_AddStringToObject(reported, "event_direction", state.event_direction.c_str());
     if (state.sensor_sample_rate != 0) cJSON_AddNumberToObject(reported, "sensor_sample_rate", state.sensor_sample_rate);
     if (state.acquire_gps_valid) cJSON_AddBoolToObject(reported, "acquire_gps", state.acquire_gps);
     if (state.mqtt_timeout != 0) cJSON_AddNumberToObject(reported, "mqtt_timeout", state.mqtt_timeout);
@@ -284,10 +286,6 @@ void MergeShadowDelta(DeviceShadowState& currentState, const DeviceShadowState& 
         currentState.post_dwell_time = deltaState.post_dwell_time;
         ESP_LOGI(TAG, "Updated post_dwell_time to %u", (unsigned int)currentState.post_dwell_time);
     }
-    if (deltaState.ble_adv_time != 0) {
-        currentState.ble_adv_time = deltaState.ble_adv_time;
-        ESP_LOGI(TAG, "Updated ble_adv_time to %u ms", (unsigned int)currentState.ble_adv_time);
-    }
     if (!deltaState.mqtt_scheduled_post.empty()) {
         currentState.mqtt_scheduled_post = deltaState.mqtt_scheduled_post;
         ESP_LOGI(TAG, "Updated mqtt_scheduled_post to %s", currentState.mqtt_scheduled_post.c_str());
@@ -295,6 +293,10 @@ void MergeShadowDelta(DeviceShadowState& currentState, const DeviceShadowState& 
     if (!deltaState.event_thresholds_pct.empty()) {
         currentState.event_thresholds_pct = deltaState.event_thresholds_pct;
         ESP_LOGI(TAG, "Updated event_thresholds_pct to %s", currentState.event_thresholds_pct.c_str());
+    }
+    if (!deltaState.event_direction.empty()) {
+        currentState.event_direction = deltaState.event_direction;
+        ESP_LOGI(TAG, "Updated event_direction to %s", currentState.event_direction.c_str());
     }
     if (deltaState.sensor_sample_rate != 0) {
         currentState.sensor_sample_rate = deltaState.sensor_sample_rate;

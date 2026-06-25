@@ -65,8 +65,6 @@ static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceS
     reported.lte_timeout = deviceSettings->getLteTimeout();
     reported.fill_alarm_delta = deviceSettings->getFillAlarmDelta();
     reported.post_dwell_time = deviceSettings->getPostDwellTime();
-    reported.ble_adv_time = deviceSettings->getBleAdvTime();
-
     char mqttScheduledPost[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
     if (deviceSettings->getMqttScheduledPost(mqttScheduledPost, sizeof(mqttScheduledPost))) {
         reported.mqtt_scheduled_post = mqttScheduledPost;
@@ -76,6 +74,10 @@ static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceS
     char eventThresholds[DeviceSettings::EVENT_THRESHOLDS_BUFFER_SIZE] = {0};
     if (deviceSettings->getEventThresholdsPct(eventThresholds, sizeof(eventThresholds))) {
         reported.event_thresholds_pct = eventThresholds;
+    }
+    char eventDirection[DeviceSettings::EVENT_DIRECTION_BUFFER_SIZE] = {0};
+    if (deviceSettings->getEventDirection(eventDirection, sizeof(eventDirection))) {
+        reported.event_direction = eventDirection;
     }
 
     reported.sensor_sample_rate = deviceSettings->getSensorSampleRateMinutes();
@@ -468,14 +470,14 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
             // 0 means "field not present in shadow" — skip those.
             if (_parentStateMachine) _parentStateMachine->updateSchedulesFromShadow(shadow);
             if (shadow.fill_dwell_time != 0) _deviceSettings->setFillDwellTime(shadow.fill_dwell_time);
-            if (shadow.lte_timeout      != 0) _deviceSettings->setLteTimeout(shadow.lte_timeout);
             if (shadow.fill_alarm_delta != 0) _deviceSettings->setFillAlarmDelta(shadow.fill_alarm_delta);
             if (shadow.post_dwell_time  != 0) _deviceSettings->setPostDwellTime(shadow.post_dwell_time);
-            if (shadow.ble_adv_time     != 0) _deviceSettings->setBleAdvTime(shadow.ble_adv_time);
             if (shadow.mqtt_timeout     != 0) _deviceSettings->setMqttTimeout(shadow.mqtt_timeout);
+            if (shadow.lte_timeout      != 0) _deviceSettings->setLteTimeout(shadow.lte_timeout);
             if (shadow.sensor_sample_rate != 0) _deviceSettings->setSensorSampleRateMinutes(shadow.sensor_sample_rate);
             if (shadow.event_posts_valid) _deviceSettings->setEventPosts(shadow.event_posts);
             if (!shadow.event_thresholds_pct.empty()) _deviceSettings->setEventThresholdsPct(shadow.event_thresholds_pct.c_str());
+            if (!shadow.event_direction.empty()) _deviceSettings->setEventDirection(shadow.event_direction.c_str());
             if (!shadow.mqtt_scheduled_post.empty()) _deviceSettings->setMqttScheduledPost(shadow.mqtt_scheduled_post.c_str());
             _deviceSettings->Commit();
             DeviceShadowState reported = buildReportedShadowFromSettings(_deviceSettings, shadow);
@@ -852,8 +854,6 @@ void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContex
         ctx.fillDwellTimeValid = true;
         ctx.lteAttemptTimeout = _deviceSettings->getLteTimeout();
         ctx.lteAttemptTimeoutValid = true;
-        ctx.bleAdvTime = _deviceSettings->getBleAdvTime();
-        ctx.bleAdvTimeValid = true;
         ctx.fillPostDeltaValue = _deviceSettings->getFillAlarmDelta();
         ctx.fillPostDeltaValueValid = true;
         ctx.postDwellTime = _deviceSettings->getPostDwellTime();

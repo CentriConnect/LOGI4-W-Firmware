@@ -39,6 +39,7 @@ private:
     bool IsValidDateTime(time_t time);
     bool IsProvisioned(const DeviceSettings& deviceSettings);
     void update_last_post_time(int64_t current_time);
+    bool evaluateEventThresholdPost(float& ratioPct, float& crossedThreshold);
 
     void ScheduleCheckStateValidateDateTime();
     void ScheduleCheckStateCheckProvisioning();

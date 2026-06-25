@@ -14,14 +14,14 @@ struct DeviceShadowState {
 
     // --- Other fields remain the same ---
     uint32_t fill_dwell_time = 0; // Units: seconds. REV B min 300.
-    uint32_t lte_timeout = 0;     // Units: seconds. REV B renames to wifi_timeout; same field, min 300.
+    uint32_t lte_timeout = 0;     // Units: seconds. REV B renames to wifi_timeout; same field, min 15.
     uint8_t fill_alarm_delta = 0; // Units: percent. REV B min 10.
     uint32_t post_dwell_time = 0; // Units: seconds. REV B min 60.
-    uint32_t ble_adv_time = 0;    // REQ-SHADOW: BLE adv interval (ms). REV B min 1000, default 8000.
     std::string mqtt_scheduled_post;
     bool event_posts = false;
     bool event_posts_valid = false;
     std::string event_thresholds_pct;
+    std::string event_direction;
     uint32_t sensor_sample_rate = 0;
     bool acquire_gps = false;
     bool acquire_gps_valid = false;
