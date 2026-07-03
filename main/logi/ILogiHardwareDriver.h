@@ -113,6 +113,12 @@ public:
     /// can acquire a fix in the background (e.g. across the activation cycle).
     /// </summary>
     virtual void SetGnssPower(bool on) = 0;
+
+    /// <summary>
+    /// Drives controllable peripherals into their lowest-power idle states
+    /// immediately before deep sleep or repair-advertising wait.
+    /// </summary>
+    virtual void PrepareForSleep() = 0;
 };
 
 #endif // I_LOGI_HARDWARE_DRIVER_H

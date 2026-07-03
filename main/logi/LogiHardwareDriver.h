@@ -73,6 +73,7 @@ public:
     void PrintGpsStatus();
     bool HasValidGpsFix();
     void SetGnssPower(bool on) override;
+    void PrepareForSleep() override;
 
     /// v1.2.1: optional platform hook to rebuild the I2C bus when transactions
     /// are persistently failing (wedged bus driver). Set by the hardware factory.

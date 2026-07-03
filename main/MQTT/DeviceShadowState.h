@@ -29,6 +29,9 @@ struct DeviceShadowState {
 
     // Provisioning reset trigger (cloud-initiated)
     bool reset_provisioning = false;
+    bool wifi_reset_req = false;
+    bool wifi_reset_req_valid = false;
+    bool clear_wifi_reset_req_desired = false;
 
     // Note: post_hour and post_minute are now managed by post_schedule
     int post_hour = 0;

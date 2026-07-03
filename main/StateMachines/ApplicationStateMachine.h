@@ -61,6 +61,10 @@ public:
     void recordSensorSampleTime(time_t sampleTime);
 
     bool checkAndConnectWifi();
+    void onProvisioningWifiRecovered();
+    void requestWifiResetRepairMode(time_t now);
+    void clearWifiResetRepairMode();
+    bool isWifiResetRepairModeActive(time_t now) const;
 
     // Update weekly schedules from shadow state and persist to NVS
     bool updateSchedulesFromShadow(const DeviceShadowState& shadowState);
@@ -125,6 +129,7 @@ private:
     void startWifiRepairAdvertisingIfDue(time_t now);
     void stopWifiRepairAdvertising();
     void waitAwakeWithRepairAdvertising(uint64_t durationUs);
+    void waitAwakeForDebugDutyCycle(uint64_t durationUs, const char* reason);
     void resetDutyCycleStateMachines();
     void markWifiOutageStarted(time_t now);
     void clearWifiOutage();

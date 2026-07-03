@@ -50,6 +50,8 @@ struct TelemetryContext
 
     // Network & Status
     int32_t lteSignalQuality;   // WiFi RSSI for WiFi variant
+    char wifiSsid[33];          // Connected WiFi network name
+    bool wifiReset;
     int32_t chargerStatus;
     int32_t bleStatus;
     char errorLog[256];
@@ -76,6 +78,8 @@ struct TelemetryContext
     bool deviceVersionValid;
     bool modemFirmwareVersionValid;
     bool lteSignalQualityValid;
+    bool wifiSsidValid;
+    bool wifiResetValid;
     bool chargerStatusValid;
     bool bleStatusValid;
     bool errorLogValid;

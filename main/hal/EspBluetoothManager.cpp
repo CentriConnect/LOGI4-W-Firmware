@@ -21,12 +21,20 @@ void EspBluetoothManager::init()
     }
 
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    if (err == ESP_ERR_INVALID_STATE)
     {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+        ESP_LOGD(TAG, "NVS flash already initialized.");
     }
-    ESP_ERROR_CHECK(err);
+    else if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_LOGE(TAG, "NVS flash unavailable for BLE init: %s", esp_err_to_name(err));
+        return;
+    }
+    else if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "nvs_flash_init failed during BLE init: %s", esp_err_to_name(err));
+        return;
+    }
 
     // Register instance for static callbacks
     s_instance = this;
@@ -94,6 +102,8 @@ void EspBluetoothManager::deinit()
     _initialized = false;
     _hostSynced  = false;
     _advertising = false;
+    _advertisingRequested = false;
+    _connected = false;
 
     ESP_LOGI(TAG, "NimBLE deinitialized.");
 }
@@ -173,6 +183,8 @@ bool EspBluetoothManager::startAdvertising(const char* name, uint32_t intervalMs
         return false;
     }
 
+    _advertisingRequested = true;
+
     if (_hostSynced)
     {
         // We can start right away
@@ -195,12 +207,28 @@ bool EspBluetoothManager::startAdvertising(const char* name, uint32_t intervalMs
 
 void EspBluetoothManager::stopAdvertising()
 {
+    _advertisingRequested = false;
     if (!_advertising)
     {
         return;
     }
     ble_gap_adv_stop();
     _advertising = false;
+}
+
+void EspBluetoothManager::disconnect(uint8_t reason)
+{
+    if (!_initialized || !_connected)
+    {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Terminating BLE repair-trigger connection, handle=%d", _connHandle);
+    int rc = ble_gap_terminate(_connHandle, reason);
+    if (rc != 0)
+    {
+        ESP_LOGW(TAG, "ble_gap_terminate failed, rc=%d", rc);
+    }
 }
 
 // ===== Host task =====
@@ -231,6 +259,7 @@ void EspBluetoothManager::onReset(int reason)
     ESP_LOGW(TAG, "NimBLE reset; reason=%d", reason);
     _hostSynced = false;
     _advertising = false;
+    _connected = false;
 }
 
 void EspBluetoothManager::onSync()
@@ -244,7 +273,7 @@ void EspBluetoothManager::onSync()
     ble_svc_gap_device_name_set(_advName);
 
     // If someone requested ADV earlier, kick it off now
-    if (setAdvData(_advName) == 0)
+    if (_advertisingRequested && setAdvData(_advName) == 0)
     {
         startAdvertisingInternal();
         _advertising = true;
@@ -300,6 +329,8 @@ int EspBluetoothManager::gapEventCb(struct ble_gap_event* event, void* arg)
                 ESP_LOGI(TAG, "BLE connection established, handle=%d", event->connect.conn_handle);
                 if (self)
                 {
+                    self->_advertising = false;
+                    self->_connected = true;
                     self->_connHandle = event->connect.conn_handle;
                     self->startInactivityTimer();
                     if (self->_connectionCallback)
@@ -311,15 +342,19 @@ int EspBluetoothManager::gapEventCb(struct ble_gap_event* event, void* arg)
             else
             {
                 ESP_LOGW(TAG, "BLE connection failed, status=%d", event->connect.status);
-                if (self) self->startAdvertisingInternal();
+                if (self && self->_advertisingRequested) self->startAdvertisingInternal();
             }
             return 0;
         }
 
         case BLE_GAP_EVENT_DISCONNECT:
         {
-            if (self) self->stopInactivityTimer();
-            if (self) self->startAdvertisingInternal();
+            if (self)
+            {
+                self->_connected = false;
+                self->stopInactivityTimer();
+            }
+            if (self && self->_advertisingRequested) self->startAdvertisingInternal();
             return 0;
         }
 

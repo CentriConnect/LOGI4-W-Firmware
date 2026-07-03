@@ -583,6 +583,19 @@ void LogiHardwareDriver::SetGnssPower(bool on)
     LOGI_DRV_LOG_DBG("GNSS power %s", on ? "ON" : "OFF");
 }
 
+void LogiHardwareDriver::PrepareForSleep()
+{
+    LOGI_DRV_LOG_INF("Preparing hardware for sleep: LED/GNSS/SPS/MEASURE off");
+
+    SetLedState(LedState::LedState_Off);
+    DisableLed();
+
+    _gnssResetGpio.Write(false);   // GNSS_RESET_N active LOW: hold module reset.
+    _gnssEnableGpio.Write(false);  // Remove GNSS rail enable.
+    _sensorPowerGpio.Write(false); // Keep +3.3S / fuel head power off.
+    _measureGpio.Write(false);     // Disable measurement dividers.
+}
+
 // --- LED Control --- (Implementation remains the same as previous version)
 void LogiHardwareDriver::SetupLed()
 {

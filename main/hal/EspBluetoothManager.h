@@ -29,8 +29,12 @@ public:
     /// Stop advertising (no-op if not advertising)
     void stopAdvertising();
 
+    /// Drop an active repair-trigger connection before switching BLE owners.
+    void disconnect(uint8_t reason = BLE_ERR_REM_USER_CONN_TERM);
+
     bool isInitialized() const { return _initialized; }
-    bool isAdvertising() const { return _advertising; }
+    bool isAdvertising() const { return _advertising || _advertisingRequested; }
+    bool isConnected() const { return _connected; }
 
     /// Register a callback to be invoked when a BLE connection is received.
     /// Used to trigger provisioning mode from ApplicationStateMachine.
@@ -64,6 +68,8 @@ private:
     bool _running     = false;
     bool _hostSynced  = false;
     bool _advertising = false;
+    bool _advertisingRequested = false;
+    bool _connected = false;
 
     // BLE inactivity timeout
     TimerHandle_t _inactivityTimer = nullptr;

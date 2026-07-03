@@ -481,7 +481,9 @@ std::string AwsIotClient::createTelemetryJson(const LogiSensorData& data)
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         cJSON_AddNumberToObject(root, "lsq", ap_info.rssi);
+        cJSON_AddStringToObject(root, "ssid", reinterpret_cast<const char*>(ap_info.ssid));
     }
+    cJSON_AddBoolToObject(root, "wifi_reset", false);
 
     cJSON_AddNumberToObject(root, "bat", data.AnalogBatteryVoltage);
     cJSON_AddNumberToObject(root, "ful", data.PublishedFuelLevel);
@@ -539,6 +541,11 @@ std::string AwsIotClient::createTelemetryJsonLogi4Format(const LogiSensorData& d
     {
         cJSON_AddNumberToObject(root, "lsq", ctx.lteSignalQuality);
     }
+    if (ctx.wifiSsidValid)
+    {
+        cJSON_AddStringToObject(root, "ssid", ctx.wifiSsid);
+    }
+    cJSON_AddBoolToObject(root, "wifi_reset", ctx.wifiResetValid ? ctx.wifiReset : false);
 
     cJSON_AddNumberToObject(root, "bat", data.AnalogBatteryVoltage);
     cJSON_AddNumberToObject(root, "ful", data.PublishedFuelLevel);

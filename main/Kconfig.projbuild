@@ -199,6 +199,16 @@ menu "Featured FreeRTOS IoT Integration"
                     use the hardcoded credentials from wifiCredentials.h.
                     For debugging/testing only.
 
+            config LOGI_DEBUG_CONTINUOUS_DUTY_LOGGING
+                bool "Keep normal duty cycle awake for continuous debug logging"
+                default n
+                help
+                    For bench/debug builds only. When enabled, normal duty-cycle
+                    sleep is replaced by an awake wait that logs progress and
+                    then loops back through the wake/data/post states. This keeps
+                    serial logging available while testing behavior such as
+                    turning Wi-Fi off after provisioning.
+
         endmenu  #Debug Options
 
         menu "Version Info"

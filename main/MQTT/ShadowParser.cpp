@@ -198,6 +198,13 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
             success = true;
         }
 
+        item = cJSON_GetObjectItem(config, "wifi_reset_req");
+        if (item && cJSON_IsBool(item)) {
+            stateOut.wifi_reset_req = cJSON_IsTrue(item);
+            stateOut.wifi_reset_req_valid = true;
+            success = true;
+        }
+
         item = cJSON_GetObjectItem(config, "mqtt_timeout");
         if (item && cJSON_IsNumber(item)) {
             uint32_t v = (uint32_t)item->valueint;
@@ -244,12 +251,18 @@ std::string CreateEnhancedShadowUpdate(const DeviceShadowState& state, const Log
     if (!state.event_direction.empty()) cJSON_AddStringToObject(reported, "event_direction", state.event_direction.c_str());
     if (state.sensor_sample_rate != 0) cJSON_AddNumberToObject(reported, "sensor_sample_rate", state.sensor_sample_rate);
     if (state.acquire_gps_valid) cJSON_AddBoolToObject(reported, "acquire_gps", state.acquire_gps);
+    cJSON_AddBoolToObject(reported, "wifi_reset_req", state.wifi_reset_req);
     if (state.mqtt_timeout != 0) cJSON_AddNumberToObject(reported, "mqtt_timeout", state.mqtt_timeout);
 
     // NOTE: All old fields like 'postingConfig', 'fotaConfig', and 'deviceStatus'
     // are now intentionally omitted to create the clean format you want.
 
     // Construct the final JSON document
+    if (state.clear_wifi_reset_req_desired) {
+        cJSON* desired = cJSON_CreateObject();
+        cJSON_AddBoolToObject(desired, "wifi_reset_req", false);
+        cJSON_AddItemToObject(stateObj, "desired", desired);
+    }
     cJSON_AddItemToObject(stateObj, "reported", reported);
     cJSON_AddItemToObject(root, "state", stateObj);
     
@@ -315,6 +328,11 @@ void MergeShadowDelta(DeviceShadowState& currentState, const DeviceShadowState& 
         currentState.acquire_gps = deltaState.acquire_gps;
         currentState.acquire_gps_valid = true;
         ESP_LOGI(TAG, "Updated acquire_gps to %s", currentState.acquire_gps ? "true" : "false");
+    }
+    if (deltaState.wifi_reset_req_valid) {
+        currentState.wifi_reset_req = deltaState.wifi_reset_req;
+        currentState.wifi_reset_req_valid = true;
+        ESP_LOGI(TAG, "Updated wifi_reset_req to %s", currentState.wifi_reset_req ? "true" : "false");
     }
 }
 

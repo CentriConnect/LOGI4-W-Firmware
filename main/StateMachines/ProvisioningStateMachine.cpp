@@ -30,7 +30,8 @@ static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
 static constexpr uint32_t PROVISIONING_SUCCESS_BLE_GRACE_MS = 3000;
 
 static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceSettings,
-                                                         const DeviceShadowState& parsedShadowState)
+                                                         const DeviceShadowState& parsedShadowState,
+                                                         bool clearWifiResetRequest = false)
 {
     DeviceShadowState reported{};
 
@@ -88,6 +89,11 @@ static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceS
     // only when this cycle successfully parsed them from desired.
     reported.acquire_gps = parsedShadowState.acquire_gps;
     reported.acquire_gps_valid = parsedShadowState.acquire_gps_valid;
+    reported.wifi_reset_req = clearWifiResetRequest
+        ? false
+        : (parsedShadowState.wifi_reset_req_valid ? parsedShadowState.wifi_reset_req : false);
+    reported.wifi_reset_req_valid = true;
+    reported.clear_wifi_reset_req_desired = clearWifiResetRequest;
     reported.mqtt_timeout = parsedShadowState.mqtt_timeout;
 
     return reported;
@@ -161,7 +167,7 @@ void ProvisioningStateMachine::update()
     }
 
     // ISS-FW-020 deadman: transient states must make progress. Advertising
-    // (bounded by the 48 h timeout) and SuccessDisplay (bounded by its 30 min
+    // (bounded by the 48 h timeout) and SuccessDisplay (bounded by its configured
     // window) are exempt; everything else older than the deadman means a lost
     // event or wedged handshake -> reboot. SW reset preserves credentials, so
     // a provisioned device lands in duty cycle and an unprovisioned one
@@ -327,6 +333,10 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
             transitionTo(ProvisioningState::ProvisioningState_Failed);
             return;
         }
+
+        if (_parentStateMachine) {
+            _parentStateMachine->onProvisioningWifiRecovered();
+        }
     } else {
         ESP_LOGE(TAG, "Failed to get WiFi config — staying in provisioning");
         transitionTo(ProvisioningState::ProvisioningState_Failed);
@@ -397,7 +407,7 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
              CONFIG_LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN);
 
     // Green LED on from AWS-connect so it blinks 1 Hz for the WHOLE window (the
-    // first-boot cycle + the 30-min success-display hold), per the activation spec.
+    // first-boot cycle + the configured success-display hold), per the activation spec.
     if (_driver) {
         _driver->SetLedState(LedState::LedState_GreenBlink);
     }
@@ -497,7 +507,14 @@ void ProvisioningStateMachine::ProvisioningStatePostJobsShadow()
             if (!shadow.event_direction.empty()) _deviceSettings->setEventDirection(shadow.event_direction.c_str());
             if (!shadow.mqtt_scheduled_post.empty()) _deviceSettings->setMqttScheduledPost(shadow.mqtt_scheduled_post.c_str());
             _deviceSettings->Commit();
-            DeviceShadowState reported = buildReportedShadowFromSettings(_deviceSettings, shadow);
+            const bool clearWifiResetRequest = shadow.wifi_reset_req_valid && shadow.wifi_reset_req;
+            if (_parentStateMachine) {
+                _parentStateMachine->clearWifiResetRepairMode();
+                if (clearWifiResetRequest) {
+                    ESP_LOGI(TAG, "Shadow wifi_reset_req=true after Wi-Fi reprovision; reporting request cleared");
+                }
+            }
+            DeviceShadowState reported = buildReportedShadowFromSettings(_deviceSettings, shadow, clearWifiResetRequest);
             if (_awsIotManager->UpdateShadowWithStatus(reported)) {
                 ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [2/4]: shadow applied and reported");
             } else {
@@ -711,10 +728,11 @@ esp_err_t ProvisioningStateMachine::startProvisioningService()
         ESP_LOGI(TAG, "Prov: light sleep DISABLED (V13-013 INT_WDT fix) - window stays awake");
     }
 
-    wifi_prov_mgr_config_t config = {
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM
-    };
+    wifi_prov_mgr_config_t config = {};
+    config.scheme = wifi_prov_scheme_ble;
+    // Keep BLE memory available after provisioning. The normal duty cycle can
+    // later start the repair beacon in the same boot if Wi-Fi is lost.
+    config.scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT;
 
     esp_err_t err = wifi_prov_mgr_init(config);
     if (err != ESP_OK) {
@@ -985,7 +1003,14 @@ void ProvisioningStateMachine::populateFirstBootTelemetryContext(TelemetryContex
     if (esp_wifi_sta_get_ap_info(&apInfo) == ESP_OK) {
         ctx.lteSignalQuality = apInfo.rssi;
         ctx.lteSignalQualityValid = true;
+        strncpy(ctx.wifiSsid, reinterpret_cast<const char*>(apInfo.ssid), sizeof(ctx.wifiSsid) - 1);
+        ctx.wifiSsid[sizeof(ctx.wifiSsid) - 1] = '\0';
+        ctx.wifiSsidValid = true;
     }
+
+    ctx.wifiReset = (_parentStateMachine != nullptr) &&
+                    _parentStateMachine->isWifiResetRepairModeActive(_timeKeeper ? _timeKeeper->GetCurrentTime() : time(nullptr));
+    ctx.wifiResetValid = true;
 
     ctx.chargerStatus = (_driver != nullptr && _driver->IsChargingErrorActive()) ? 1 : 0;
     ctx.chargerStatusValid = true;

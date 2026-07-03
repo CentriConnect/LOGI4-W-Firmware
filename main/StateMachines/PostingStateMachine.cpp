@@ -333,6 +333,8 @@ DeviceShadowState PostingStateMachine::buildReportedShadowFromSettings(const Dev
     // only when this cycle successfully parsed them from desired.
     reported.acquire_gps = parsedShadowState.acquire_gps;
     reported.acquire_gps_valid = parsedShadowState.acquire_gps_valid;
+    reported.wifi_reset_req = parsedShadowState.wifi_reset_req_valid ? parsedShadowState.wifi_reset_req : false;
+    reported.wifi_reset_req_valid = true;
     reported.mqtt_timeout = parsedShadowState.mqtt_timeout;
 
     return reported;
@@ -555,6 +557,19 @@ void PostingStateMachine::PostingStateSendGetShadowDelta()
         ESP_LOGI(TAG, "Activation [2/5]: shadow fetched; applying settings to memory");
         applyShadowSettingsToMemory(_shadowState);
 
+        if (_shadowState.wifi_reset_req_valid && _parentStateMachine)
+        {
+            if (_shadowState.wifi_reset_req)
+            {
+                ESP_LOGW(TAG, "Shadow wifi_reset_req=true; arming Wi-Fi reset repair advertising mode");
+                _parentStateMachine->requestWifiResetRepairMode(_timeKeeper->GetCurrentTime());
+            }
+            else
+            {
+                _parentStateMachine->clearWifiResetRepairMode();
+            }
+        }
+
         DeviceShadowState reportedState = buildReportedShadowFromSettings(_shadowState);
         if (_awsIotManager->UpdateShadowWithStatus(reportedState))
         {
@@ -621,6 +636,19 @@ void PostingStateMachine::PostingStateHandleShadowDelta()
 
     // 2. Persist accepted shadow values to DeviceSettings/NVS before reporting.
     applyShadowSettingsToMemory(_shadowState);
+
+    if (_shadowState.wifi_reset_req_valid && _parentStateMachine)
+    {
+        if (_shadowState.wifi_reset_req)
+        {
+            ESP_LOGW(TAG, "Shadow delta wifi_reset_req=true; arming Wi-Fi reset repair advertising mode");
+            _parentStateMachine->requestWifiResetRepairMode(_timeKeeper->GetCurrentTime());
+        }
+        else
+        {
+            _parentStateMachine->clearWifiResetRepairMode();
+        }
+    }
 
     // 3. Post the updated state back to the shadow's "reported" section.
     //    This confirms to the cloud that we have accepted and applied the changes.
@@ -1085,7 +1113,14 @@ void PostingStateMachine::populateTelemetryContext(TelemetryContext& ctx) const
     {
         ctx.lteSignalQuality = ap_info.rssi;
         ctx.lteSignalQualityValid = true;
+        strncpy(ctx.wifiSsid, reinterpret_cast<const char*>(ap_info.ssid), sizeof(ctx.wifiSsid) - 1);
+        ctx.wifiSsid[sizeof(ctx.wifiSsid) - 1] = '\0';
+        ctx.wifiSsidValid = true;
     }
+
+    ctx.wifiReset = (_parentStateMachine != nullptr) &&
+                    _parentStateMachine->isWifiResetRepairModeActive(_timeKeeper->GetCurrentTime());
+    ctx.wifiResetValid = true;
 
     // === Charger Status ===
     ctx.chargerStatus = (_driver != nullptr && _driver->IsChargingErrorActive()) ? 1 : 0;
