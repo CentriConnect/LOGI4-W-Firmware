@@ -147,7 +147,7 @@ menu "Featured FreeRTOS IoT Integration"
 
             config LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN
                 int "Minutes to blink green LED after successful provisioning before rebooting."
-                default 30
+                default 5
 
             config AWS_IOT_POLL_THREAD_STACK_SIZE
                 int "Configures the size of the AWS_IOT Polling thread, which needs to accomodate firmware updates."

@@ -29,6 +29,22 @@ const char* ProvisioningStateMachine::NVS_BACKUP_PASS_KEY = "backup_pass";
 static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
 static constexpr uint32_t PROVISIONING_SUCCESS_BLE_GRACE_MS = 3000;
 
+static bool isWifiAuthFailureReason(int reason)
+{
+    return reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+           reason == WIFI_REASON_AUTH_FAIL ||
+           reason == WIFI_REASON_HANDSHAKE_TIMEOUT ||
+           reason == WIFI_REASON_MIC_FAILURE;
+}
+
+static bool isWifiApNotFoundReason(int reason)
+{
+    return reason == WIFI_REASON_NO_AP_FOUND ||
+           reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+           reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
+           reason == WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD;
+}
+
 static DeviceShadowState buildReportedShadowFromSettings(DeviceSettings* deviceSettings,
                                                          const DeviceShadowState& parsedShadowState,
                                                          bool clearWifiResetRequest = false)
@@ -132,13 +148,18 @@ bool ProvisioningStateMachine::init(ProvisioningMode mode)
     _provisioningSuccess = false;
     _isBluetoothConnected = false;
     _credentialsReceived = false;
+    _pendingSsid[0] = '\0';
+    _pendingPassword[0] = '\0';
     _provisioningStartTimeMs = 0;
+    _resetProvisioningManagerOnFailure = false;
+    _resetProvisioningManagerForReprovision = false;
     _successDisplayStartMs = 0;
     _stateEnteredMs = esp_timer_get_time() / 1000; // arm deadman from init
     _firstBootGpsStartMs = 0;
     _firstBootLastGpsLogMs = 0;
     _firstBootGpsSnapshot = {};
     _firstBootGpsSnapshotValid = false;
+    _lastStaDisconnectReason = 0;
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
@@ -330,6 +351,7 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
         if (!saveCredentialsToNvs((const char*)wifi_cfg.sta.ssid,
                                   (const char*)wifi_cfg.sta.password)) {
             ESP_LOGE(TAG, "NVS credential write failed — staying in provisioning");
+            _resetProvisioningManagerForReprovision = true;
             transitionTo(ProvisioningState::ProvisioningState_Failed);
             return;
         }
@@ -351,18 +373,23 @@ void ProvisioningStateMachine::ProvisioningStateSuccess()
         if (!_timeKeeper->SyncTime()) {
             ESP_LOGE(TAG, "NTP sync failed before AWS IoT connect - staying in provisioning");
             Faults_Set(FAULT_NTP);
+            _resetProvisioningManagerForReprovision = true;
             transitionTo(ProvisioningState::ProvisioningState_Failed);
             return;
         }
     }
 
     ESP_LOGI(TAG, "Testing AWS IoT connection waterfall...");
-    bool awsWaterfallConnected = _awsIotManager && _awsIotManager->ConnectWithWaterfall(AWS_IOT_ACTIVATION_WATERFALL_TIMEOUT_S);
+    bool awsWaterfallConnected = _awsIotManager &&
+                                 _awsIotManager->ConnectWithActivationWaterfall(
+                                     AWS_IOT_ACTIVATION_PRIMARY_TIMEOUT_S,
+                                     AWS_IOT_ACTIVATION_BACKUP_TIMEOUT_S);
     if (!awsWaterfallConnected) {
         ESP_LOGE(TAG, "AWS IoT connection failed - attempting UDP activation fallback");
         Faults_Set(FAULT_AWS);
         if (!publishFirstBootUdpTelemetry()) {
             ESP_LOGE(TAG, "UDP activation fallback failed - staying in provisioning");
+            _resetProvisioningManagerForReprovision = true;
             transitionTo(ProvisioningState::ProvisioningState_Failed);
             return;
         }
@@ -644,14 +671,28 @@ void ProvisioningStateMachine::ProvisioningStateSuccessDisplay()
 
 void ProvisioningStateMachine::ProvisioningStateFailed()
 {
-    ESP_LOGW(TAG, "Credential verification failed — allowing retry");
+    ESP_LOGW(TAG, "Provisioning verification failed — allowing retry");
 
     // Return to blue blink (Req #4: failed credentials keep device in provisioning)
     if (_driver) {
         _driver->SetLedState(LedState::LedState_BlueBlink);
     }
 
-    wifi_prov_mgr_reset_sm_state_on_failure();
+    if (_resetProvisioningManagerOnFailure) {
+        esp_err_t err = wifi_prov_mgr_reset_sm_state_on_failure();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Provisioning failure-state reset failed: %s", esp_err_to_name(err));
+        }
+        _resetProvisioningManagerOnFailure = false;
+    }
+
+    if (_resetProvisioningManagerForReprovision) {
+        esp_err_t err = wifi_prov_mgr_reset_sm_state_for_reprovision();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Provisioning reprovision-state reset failed: %s", esp_err_to_name(err));
+        }
+        _resetProvisioningManagerForReprovision = false;
+    }
 
     _credentialsReceived = false;
 
@@ -863,7 +904,7 @@ bool ProvisioningStateMachine::publishFirstBootUdpTelemetry()
     TelemetryContext context{};
     populateFirstBootTelemetryContext(context, _firstBootSensorSnapshot);
     ESP_LOGI(TAG, "Publishing activation telemetry via compact UDP fallback");
-    return UdpTelemetryClient::SendTelemetry(_firstBootSensorSnapshot, context);
+    return UdpTelemetryClient::SendTelemetry(_firstBootSensorSnapshot, context, 1);
 }
 
 bool ProvisioningStateMachine::reconnectForFinalActivationPost()
@@ -885,7 +926,9 @@ bool ProvisioningStateMachine::reconnectForFinalActivationPost()
         ESP_LOGW(TAG, "REQ-FIRSTBOOT-01 [5/5]: AWS MQTT not connected before final activation POST; reconnecting");
     }
 
-    bool connected = _awsIotManager->ConnectWithWaterfall(AWS_IOT_ACTIVATION_WATERFALL_TIMEOUT_S);
+    bool connected = _awsIotManager->ConnectWithActivationWaterfall(
+        AWS_IOT_ACTIVATION_PRIMARY_TIMEOUT_S,
+        AWS_IOT_ACTIVATION_BACKUP_TIMEOUT_S);
     if (connected)
     {
         ESP_LOGI(TAG, "REQ-FIRSTBOOT-01 [5/5]: final activation MQTT reconnect ok on port %s",
@@ -1180,6 +1223,15 @@ void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t 
 {
     ProvisioningStateMachine* self = static_cast<ProvisioningStateMachine*>(arg);
 
+    if (eventBase == WIFI_EVENT && eventId == WIFI_EVENT_STA_DISCONNECTED && eventData != nullptr) {
+        const wifi_event_sta_disconnected_t* disconnected =
+            static_cast<const wifi_event_sta_disconnected_t*>(eventData);
+        self->_lastStaDisconnectReason = disconnected->reason;
+        ESP_LOGI(TAG, "Provisioning Wi-Fi verification disconnect reason: %d",
+                 self->_lastStaDisconnectReason);
+        return;
+    }
+
     if (eventBase == WIFI_PROV_EVENT) {
         switch (eventId) {
             case WIFI_PROV_START:
@@ -1195,6 +1247,8 @@ void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t 
                 strncpy(self->_pendingPassword, (const char*)wifi_sta_cfg->password,
                         sizeof(self->_pendingPassword) - 1);
 
+                ESP_LOGI(TAG, "Verifying credentials against Wi-Fi router...");
+                self->_lastStaDisconnectReason = 0;
                 self->_credentialsReceived = true;
                 self->transitionTo(ProvisioningState::ProvisioningState_VerifyCredentials);
                 break;
@@ -1206,14 +1260,38 @@ void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t 
                 break;
 
             case WIFI_PROV_CRED_FAIL: {
+                if (self->_currentState != ProvisioningState::ProvisioningState_VerifyCredentials) {
+                    ESP_LOGW(TAG,
+                             "Ignoring late provisioning credential failure outside credential verification (state=%d)",
+                             static_cast<int>(self->_currentState));
+                    break;
+                }
+
                 wifi_prov_sta_fail_reason_t* reason =
                     static_cast<wifi_prov_sta_fail_reason_t*>(eventData);
-                ESP_LOGE(TAG, "Provisioning failed: %s",
-                         (*reason == WIFI_PROV_STA_AUTH_ERROR)
-                         ? "Authentication failed"
-                         : "AP not found");
 
-                wifi_prov_mgr_reset_sm_state_on_failure();
+                bool authFailure = reason != nullptr && *reason == WIFI_PROV_STA_AUTH_ERROR;
+                bool apNotFound = reason != nullptr && *reason == WIFI_PROV_STA_AP_NOT_FOUND;
+
+                // ESP-IDF v5.5.2 copies wifi_disconnect_reason into the
+                // WIFI_PROV_CRED_FAIL event payload before updating it from
+                // WIFI_EVENT_STA_DISCONNECTED, so AP-not-found can arrive here
+                // mislabeled as auth failure. Prefer the concrete STA reason
+                // captured by this state machine when it is available.
+                if (isWifiApNotFoundReason(self->_lastStaDisconnectReason)) {
+                    authFailure = false;
+                    apNotFound = true;
+                } else if (isWifiAuthFailureReason(self->_lastStaDisconnectReason)) {
+                    authFailure = true;
+                    apNotFound = false;
+                }
+
+                ESP_LOGE(TAG, "Provisioning failed: %s (sta_reason=%d)",
+                         authFailure ? "Authentication failed" :
+                         apNotFound ? "AP not found" : "Wi-Fi verification failed",
+                         self->_lastStaDisconnectReason);
+
+                self->_resetProvisioningManagerOnFailure = true;
                 self->transitionTo(ProvisioningState::ProvisioningState_Failed);
                 break;
             }

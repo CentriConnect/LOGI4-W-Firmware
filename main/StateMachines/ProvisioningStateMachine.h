@@ -116,6 +116,9 @@ private:
 
     char _pendingSsid[33] = {0};
     char _pendingPassword[65] = {0};
+    bool _resetProvisioningManagerOnFailure = false;
+    bool _resetProvisioningManagerForReprovision = false;
+    int _lastStaDisconnectReason = 0;
 
     // State handlers
     void ProvisioningStateInit();

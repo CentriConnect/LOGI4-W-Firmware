@@ -38,7 +38,6 @@ namespace
 {
 constexpr size_t UDP_PAYLOAD_MAX_BYTES = 512;
 constexpr char TAG[] = "UdpTelemetry";
-constexpr int DNS_LOOKUP_MAX_ATTEMPTS = 3;
 constexpr uint32_t DNS_LOOKUP_RETRY_DELAY_MS = 1000;
 constexpr int UDP_ACK_TIMEOUT_MS = 2000;
 constexpr float UDP_BATTERY_TEMP_UNAVAILABLE_C = -1.0f;
@@ -286,7 +285,9 @@ std::string UdpTelemetryClient::CreatePayload(const LogiSensorData& data, const 
     return std::string(payload, static_cast<size_t>(written));
 }
 
-bool UdpTelemetryClient::SendTelemetry(const LogiSensorData& data, const TelemetryContext& context)
+bool UdpTelemetryClient::SendTelemetry(const LogiSensorData& data,
+                                       const TelemetryContext& context,
+                                       int dnsLookupMaxAttempts)
 {
     if (!IsEnabled())
     {
@@ -303,6 +304,10 @@ bool UdpTelemetryClient::SendTelemetry(const LogiSensorData& data, const Telemet
     {
         ESP_LOGE(TAG, "UDP posting enabled but HMAC secret is empty");
         return false;
+    }
+    if (dnsLookupMaxAttempts < 1)
+    {
+        dnsLookupMaxAttempts = 1;
     }
 
     const std::string payload = CreatePayload(data, context);
@@ -327,7 +332,7 @@ bool UdpTelemetryClient::SendTelemetry(const LogiSensorData& data, const Telemet
 
     struct addrinfo* res = nullptr;
     int err = EAI_FAIL;
-    for (int attempt = 1; attempt <= DNS_LOOKUP_MAX_ATTEMPTS; ++attempt)
+    for (int attempt = 1; attempt <= dnsLookupMaxAttempts; ++attempt)
     {
         err = getaddrinfo(CONFIG_LOGI_UDP_POST_HOST, port, &hints, &res);
         if (err == 0 && res != nullptr)
@@ -337,13 +342,13 @@ bool UdpTelemetryClient::SendTelemetry(const LogiSensorData& data, const Telemet
 
         ESP_LOGW(TAG, "UDP host lookup attempt %d/%d failed for %s:%s (%d/%s)",
                  attempt,
-                 DNS_LOOKUP_MAX_ATTEMPTS,
+                 dnsLookupMaxAttempts,
                  CONFIG_LOGI_UDP_POST_HOST,
                  port,
                  err,
                  gaiErrorName(err));
 
-        if (attempt < DNS_LOOKUP_MAX_ATTEMPTS)
+        if (attempt < dnsLookupMaxAttempts)
         {
             vTaskDelay(pdMS_TO_TICKS(DNS_LOOKUP_RETRY_DELAY_MS));
         }
@@ -354,7 +359,7 @@ bool UdpTelemetryClient::SendTelemetry(const LogiSensorData& data, const Telemet
         ESP_LOGE(TAG, "UDP host lookup failed for %s:%s after %d attempts (%d/%s)",
                  CONFIG_LOGI_UDP_POST_HOST,
                  port,
-                 DNS_LOOKUP_MAX_ATTEMPTS,
+                 dnsLookupMaxAttempts,
                  err,
                  gaiErrorName(err));
         return false;

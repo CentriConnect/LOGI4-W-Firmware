@@ -34,6 +34,7 @@ public:
     bool Connect();
     bool ConnectWithProfile(AwsIotConnectionProfile profile, uint32_t timeoutSeconds);
     bool ConnectWithWaterfall(uint32_t timeoutSeconds);
+    bool ConnectWithActivationWaterfall(uint32_t primaryTimeoutSeconds, uint32_t backupTimeoutSeconds);
     bool IsConnectedViaBackup443() const;
     
     /**

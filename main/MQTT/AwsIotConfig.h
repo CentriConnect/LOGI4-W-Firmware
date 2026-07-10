@@ -47,7 +47,8 @@ bool AwsIotConfig_Init(const char* thingName);
 #define AWS_IOT_MQTT_COMMAND_TIMEOUT_MS 10000
 #define AWS_IOT_MQTT_QOS                1     // QoS 1 for at least once delivery
 
-#define AWS_IOT_ACTIVATION_WATERFALL_TIMEOUT_S 60
+#define AWS_IOT_ACTIVATION_PRIMARY_TIMEOUT_S   25
+#define AWS_IOT_ACTIVATION_BACKUP_TIMEOUT_S    25
 #define AWS_IOT_DEFAULT_WATERFALL_TIMEOUT_S    120
 #define AWS_IOT_MIN_WATERFALL_TIMEOUT_S        60
 

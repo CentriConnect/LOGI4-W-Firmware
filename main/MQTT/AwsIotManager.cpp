@@ -86,6 +86,45 @@ bool AwsIotManager::ConnectWithWaterfall(uint32_t timeoutSeconds)
     return false;
 }
 
+bool AwsIotManager::ConnectWithActivationWaterfall(uint32_t primaryTimeoutSeconds,
+                                                   uint32_t backupTimeoutSeconds)
+{
+    if (primaryTimeoutSeconds == 0)
+    {
+        primaryTimeoutSeconds = AWS_IOT_ACTIVATION_PRIMARY_TIMEOUT_S;
+    }
+    if (backupTimeoutSeconds == 0)
+    {
+        backupTimeoutSeconds = AWS_IOT_ACTIVATION_BACKUP_TIMEOUT_S;
+    }
+
+    AwsIotClient* client = static_cast<AwsIotClient*>(aws_client.get());
+
+    ESP_LOGI(TAG, "AWS activation waterfall: trying primary 8883 for %lu seconds",
+             static_cast<unsigned long>(primaryTimeoutSeconds));
+    if (client->ConnectWithProfile(AwsIotConnectionProfile::Primary8883,
+                                   primaryTimeoutSeconds * 1000UL))
+    {
+        ESP_LOGI(TAG, "AWS activation waterfall connected on primary 8883");
+        return true;
+    }
+
+    Disconnect();
+
+    ESP_LOGW(TAG, "AWS activation primary 8883 failed; trying backup 443 for %lu seconds",
+             static_cast<unsigned long>(backupTimeoutSeconds));
+    if (client->ConnectWithProfile(AwsIotConnectionProfile::Backup443,
+                                   backupTimeoutSeconds * 1000UL))
+    {
+        ESP_LOGI(TAG, "AWS activation waterfall connected on backup 443");
+        return true;
+    }
+
+    Disconnect();
+    ESP_LOGE(TAG, "AWS activation waterfall failed on both primary 8883 and backup 443");
+    return false;
+}
+
 bool AwsIotManager::IsConnectedViaBackup443() const
 {
     if (!aws_client)

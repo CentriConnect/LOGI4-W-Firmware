@@ -9,7 +9,9 @@ class UdpTelemetryClient
 {
 public:
     static bool IsEnabled();
-    static bool SendTelemetry(const LogiSensorData& data, const TelemetryContext& context);
+    static bool SendTelemetry(const LogiSensorData& data,
+                              const TelemetryContext& context,
+                              int dnsLookupMaxAttempts = 3);
     static std::string CreatePayload(const LogiSensorData& data, const TelemetryContext& context);
     static std::string CreateCanonicalString(const LogiSensorData& data, const TelemetryContext& context);
 };
