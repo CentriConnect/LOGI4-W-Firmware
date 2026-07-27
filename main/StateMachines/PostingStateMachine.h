@@ -70,6 +70,7 @@ private:
     bool acquireGpsForMqttPost(LogiSensorData& data);
     void applyShadowSettingsToMemory(const DeviceShadowState& shadowState);
     DeviceShadowState buildReportedShadowFromSettings(const DeviceShadowState& parsedShadowState) const;
+    bool handleWifiResetRequestFromShadow(DeviceShadowState& shadowState, const char* source);
 
     // State handler methods
     void PostingStateInitialEnter();

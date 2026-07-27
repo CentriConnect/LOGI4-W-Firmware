@@ -135,6 +135,7 @@ ProvisioningStateMachine::ProvisioningStateMachine(EspNvsStorage* nvsStorage,
 ProvisioningStateMachine::~ProvisioningStateMachine()
 {
     unregisterGapEventListener();
+    unregisterProvisioningEventHandlers();
     wifi_prov_mgr_deinit();
 }
 
@@ -148,6 +149,10 @@ bool ProvisioningStateMachine::init(ProvisioningMode mode)
     _provisioningSuccess = false;
     _isBluetoothConnected = false;
     _credentialsReceived = false;
+    _bleConnHandle = 0;
+    _bleConnHandleValid = false;
+    _provisioningSessionHadNewCredentials = false;
+    _forceRepairBeaconOnTimeout = (mode == ProvisioningMode::ReProvision);
     _pendingSsid[0] = '\0';
     _pendingPassword[0] = '\0';
     _provisioningStartTimeMs = 0;
@@ -161,18 +166,9 @@ bool ProvisioningStateMachine::init(ProvisioningMode mode)
     _firstBootGpsSnapshotValid = false;
     _lastStaDisconnectReason = 0;
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
-        &ProvisioningStateMachine::wifiProvEventHandler, this, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID,
-        &ProvisioningStateMachine::wifiProvEventHandler, this, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
-        &ProvisioningStateMachine::wifiProvEventHandler, this, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP,
-        &ProvisioningStateMachine::wifiProvEventHandler, this, NULL));
+    if (!registerProvisioningEventHandlers()) {
+        return false;
+    }
 
     _initialized = true;
     _currentState = ProvisioningState::ProvisioningState_Init;
@@ -188,7 +184,7 @@ void ProvisioningStateMachine::update()
     }
 
     // ISS-FW-020 deadman: transient states must make progress. Advertising
-    // (bounded by the 48 h timeout) and SuccessDisplay (bounded by its configured
+    // (bounded by the provisioning timeout) and SuccessDisplay (bounded by its configured
     // window) are exempt; everything else older than the deadman means a lost
     // event or wedged handshake -> reboot. SW reset preserves credentials, so
     // a provisioned device lands in duty cycle and an unprovisioned one
@@ -232,7 +228,7 @@ void ProvisioningStateMachine::update()
         case ProvisioningState::ProvisioningState_Connected:
             ESP_LOGI(TAG, "State: Connected");
             if (isProvisioningTimedOut()) {
-                transitionTo(ProvisioningState::ProvisioningState_Timeout);
+                handleConnectedIdleTimeout();
                 break;
             }
             ProvisioningStateConnected();
@@ -240,13 +236,10 @@ void ProvisioningStateMachine::update()
 
         case ProvisioningState::ProvisioningState_VerifyCredentials:
             ESP_LOGI(TAG, "State: VerifyCredentials");
-            // ISS-FW-020: this state camps on an event that can be lost (seen
-            // 2026-06-12 under prov-window light sleep) - without a timeout
-            // check the device is unreachable forever (no adv, no USB, JTAG
-            // dead in light sleep). The 48 h timeout must escape EVERY
-            // non-terminal state.
             if (isProvisioningTimedOut()) {
-                transitionTo(ProvisioningState::ProvisioningState_Timeout);
+                ESP_LOGW(TAG, "Provisioning credential verification idle timeout - resetting for retry");
+                _resetProvisioningManagerForReprovision = true;
+                transitionTo(ProvisioningState::ProvisioningState_Failed);
                 break;
             }
             ProvisioningStateVerifyCredentials();
@@ -296,6 +289,29 @@ bool ProvisioningStateMachine::isProvisioningTimedOut() const
     return (now_ms - _provisioningStartTimeMs) >= PROVISIONING_TIMEOUT_MS;
 }
 
+void ProvisioningStateMachine::noteProvisioningActivity()
+{
+    _provisioningStartTimeMs = esp_timer_get_time() / 1000;
+}
+
+void ProvisioningStateMachine::handleConnectedIdleTimeout()
+{
+    ESP_LOGW(TAG, "BLE provisioning connection idle timeout - disconnecting and continuing advertising");
+
+    if (_bleConnHandleValid) {
+        int rc = ble_gap_terminate(_bleConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "ble_gap_terminate during provisioning idle timeout failed, rc=%d", rc);
+        }
+    }
+
+    _isBluetoothConnected = false;
+    _bleConnHandleValid = false;
+    _credentialsReceived = false;
+    noteProvisioningActivity();
+    transitionTo(ProvisioningState::ProvisioningState_Advertising);
+}
+
 // ============================================================================
 // State Handlers
 // ============================================================================
@@ -317,11 +333,10 @@ void ProvisioningStateMachine::ProvisioningStateInit()
         return;
     }
 
-    // Record start time for 48hr timeout
-    _provisioningStartTimeMs = esp_timer_get_time() / 1000;
+    noteProvisioningActivity();
 
-    ESP_LOGI(TAG, "Provisioning started with %d hour timeout",
-             CONFIG_LOGI_PROVISIONING_TIMEOUT_HOURS);
+    ESP_LOGI(TAG, "Provisioning started with %d minute idle timeout",
+             CONFIG_LOGI_PROVISIONING_TIMEOUT_MINUTES);
 
     registerGapEventListener();
 
@@ -671,6 +686,7 @@ void ProvisioningStateMachine::ProvisioningStateSuccessDisplay()
 
 void ProvisioningStateMachine::ProvisioningStateFailed()
 {
+    _forceRepairBeaconOnTimeout = true;
     ESP_LOGW(TAG, "Provisioning verification failed — allowing retry");
 
     // Return to blue blink (Req #4: failed credentials keep device in provisioning)
@@ -678,10 +694,16 @@ void ProvisioningStateMachine::ProvisioningStateFailed()
         _driver->SetLedState(LedState::LedState_BlueBlink);
     }
 
+    quiesceWifiBeforeProvisioningRetry();
+    restoreBackupAfterFailedProvisioning();
+
+    bool resetOk = true;
+
     if (_resetProvisioningManagerOnFailure) {
         esp_err_t err = wifi_prov_mgr_reset_sm_state_on_failure();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Provisioning failure-state reset failed: %s", esp_err_to_name(err));
+            resetOk = false;
         }
         _resetProvisioningManagerOnFailure = false;
     }
@@ -690,11 +712,45 @@ void ProvisioningStateMachine::ProvisioningStateFailed()
         esp_err_t err = wifi_prov_mgr_reset_sm_state_for_reprovision();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Provisioning reprovision-state reset failed: %s", esp_err_to_name(err));
+            resetOk = false;
         }
         _resetProvisioningManagerForReprovision = false;
     }
 
     _credentialsReceived = false;
+    _provisioningSessionHadNewCredentials = false;
+    noteProvisioningActivity();
+
+    if (!resetOk) {
+        ESP_LOGW(TAG, "Provisioning manager reset failed after Wi-Fi quiesce; restarting BLE provisioning service");
+        stopProvisioningService();
+
+        bool restarted = registerProvisioningEventHandlers();
+        if (restarted) {
+            esp_err_t err = startProvisioningService();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Provisioning service restart after reset failure failed: %s",
+                         esp_err_to_name(err));
+                restarted = false;
+            }
+        }
+
+        if (restarted) {
+            registerGapEventListener();
+            noteProvisioningActivity();
+            transitionTo(ProvisioningState::ProvisioningState_Advertising);
+        } else {
+            ESP_LOGE(TAG, "Unable to restart BLE provisioning service; entering repair beacon as last resort");
+            _provisioningComplete = true;
+            _provisioningSuccess = false;
+            if (_parentStateMachine) {
+                time_t now = _timeKeeper ? _timeKeeper->GetCurrentTime() : time(nullptr);
+                _parentStateMachine->requestProvisioningTimeoutRepairMode(now);
+                _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
+            }
+        }
+        return;
+    }
 
     if (_isBluetoothConnected) {
         transitionTo(ProvisioningState::ProvisioningState_Connected);
@@ -705,8 +761,8 @@ void ProvisioningStateMachine::ProvisioningStateFailed()
 
 void ProvisioningStateMachine::ProvisioningStateTimeout()
 {
-    ESP_LOGW(TAG, "Provisioning timeout reached (%d hours)",
-             CONFIG_LOGI_PROVISIONING_TIMEOUT_HOURS);
+    ESP_LOGW(TAG, "Provisioning timeout reached (%d minutes)",
+             CONFIG_LOGI_PROVISIONING_TIMEOUT_MINUTES);
 
     stopProvisioningService();
 
@@ -717,7 +773,7 @@ void ProvisioningStateMachine::ProvisioningStateTimeout()
     _provisioningComplete = true;
     _provisioningSuccess = false;
 
-    if (hasStoredCredentials()) {
+    if (!_forceRepairBeaconOnTimeout && hasStoredCredentials()) {
         // Has valid creds — reboot into normal duty cycle (Req #6)
         ESP_LOGI(TAG, "Valid credentials exist — rebooting to normal duty cycle");
         restoreBackupCredentials();
@@ -729,12 +785,18 @@ void ProvisioningStateMachine::ProvisioningStateTimeout()
             esp_restart();
         }
     } else {
-        // No valid creds — deep sleep indefinitely (Req #6)
-        ESP_LOGW(TAG, "No valid credentials — entering indefinite deep sleep");
+        ESP_LOGW(TAG, "Entering BLE repair-beacon mode after provisioning timeout");
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-        esp_deep_sleep_start();
+        if (_parentStateMachine) {
+            time_t now = _timeKeeper ? _timeKeeper->GetCurrentTime() : time(nullptr);
+            _parentStateMachine->requestProvisioningTimeoutRepairMode(now);
+            _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
+        } else {
+            ESP_LOGE(TAG, "No parent state machine for repair beacon mode; falling back to last-resort deep sleep");
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            esp_deep_sleep_start();
+        }
     }
 }
 
@@ -745,7 +807,7 @@ void ProvisioningStateMachine::ProvisioningStateTimeout()
 esp_err_t ProvisioningStateMachine::startProvisioningService()
 {
     ESP_LOGI(TAG, "Starting WiFi provisioning service");
-    // REQ-PROV-02 (v1.3.0): auto light sleep during the 48 h prov window with
+    // REQ-PROV-02 (v1.3.0): auto light sleep during the prov window with
     // 1 Hz BLE advertising. HISTORY: v1.2.0 shipped this with the BLE LP clock
     // on the main XTAL (off in light sleep) - advertising, USB, and the LED
     // all died (Nick board-2; bench-reproduced 2026-06-12) and v1.2.1 pinned
@@ -819,6 +881,7 @@ void ProvisioningStateMachine::stopProvisioningService()
     wifi_prov_mgr_stop_provisioning();
     wifi_prov_mgr_deinit();
     unregisterGapEventListener();
+    unregisterProvisioningEventHandlers();
     // REQ-PROV-02: re-acquire NO_LIGHT_SLEEP lock when leaving prov mode (normal
     // duty cycle uses deep sleep between minute wakes, not auto light sleep).
     if (_powerManager) {
@@ -1142,6 +1205,39 @@ bool ProvisioningStateMachine::loadCredentialsFromNvs(char* ssid, size_t ssidLen
     return gotSsid && gotPass && strlen(ssid) > 0;
 }
 
+void ProvisioningStateMachine::restoreBackupAfterFailedProvisioning()
+{
+    if (!_provisioningSessionHadNewCredentials) {
+        return;
+    }
+
+    esp_err_t err = restoreBackupCredentials();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Restored previous Wi-Fi credentials after failed provisioning attempt");
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "No previous Wi-Fi credentials to restore after failed provisioning attempt");
+    } else {
+        ESP_LOGW(TAG, "Failed to restore previous Wi-Fi credentials after provisioning failure: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+void ProvisioningStateMachine::quiesceWifiBeforeProvisioningRetry()
+{
+    // ESP-IDF rejects provisioning-manager reset calls while STA is still
+    // connecting/reconnecting. Disconnect the in-flight STA attempt before
+    // asking the provisioning manager to clear credentials or reprovision state.
+    // Do not stop Wi-Fi here: the provisioning service still needs the driver
+    // running for subsequent BLE scan requests.
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "esp_wifi_disconnect before provisioning retry failed: %s",
+                 esp_err_to_name(err));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(750));
+}
+
 esp_err_t ProvisioningStateMachine::backupCurrentCredentials()
 {
     wifi_config_t current_config;
@@ -1195,8 +1291,78 @@ esp_err_t ProvisioningStateMachine::restoreBackupCredentials()
 // Event Handlers
 // ============================================================================
 
+bool ProvisioningStateMachine::registerProvisioningEventHandlers()
+{
+    if (_eventHandlersRegistered) {
+        return true;
+    }
+
+    esp_err_t err = esp_event_handler_instance_register(
+        WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+        &ProvisioningStateMachine::wifiProvEventHandler, this, &_wifiProvEventInstance);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register WIFI_PROV_EVENT handler: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID,
+        &ProvisioningStateMachine::wifiProvEventHandler, this, &_wifiEventInstance);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register WIFI_EVENT handler: %s", esp_err_to_name(err));
+        unregisterProvisioningEventHandlers();
+        return false;
+    }
+
+    err = esp_event_handler_instance_register(
+        PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
+        &ProvisioningStateMachine::wifiProvEventHandler, this, &_protoBleEventInstance);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register PROTOCOMM_TRANSPORT_BLE_EVENT handler: %s", esp_err_to_name(err));
+        unregisterProvisioningEventHandlers();
+        return false;
+    }
+
+    err = esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP,
+        &ProvisioningStateMachine::wifiProvEventHandler, this, &_ipEventInstance);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register IP_EVENT handler: %s", esp_err_to_name(err));
+        unregisterProvisioningEventHandlers();
+        return false;
+    }
+
+    _eventHandlersRegistered = true;
+    return true;
+}
+
+void ProvisioningStateMachine::unregisterProvisioningEventHandlers()
+{
+    if (_wifiProvEventInstance != nullptr) {
+        esp_event_handler_instance_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, _wifiProvEventInstance);
+        _wifiProvEventInstance = nullptr;
+    }
+    if (_wifiEventInstance != nullptr) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, _wifiEventInstance);
+        _wifiEventInstance = nullptr;
+    }
+    if (_protoBleEventInstance != nullptr) {
+        esp_event_handler_instance_unregister(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, _protoBleEventInstance);
+        _protoBleEventInstance = nullptr;
+    }
+    if (_ipEventInstance != nullptr) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, _ipEventInstance);
+        _ipEventInstance = nullptr;
+    }
+    _eventHandlersRegistered = false;
+}
+
 void ProvisioningStateMachine::registerGapEventListener()
 {
+    if (_gapListenerRegistered) {
+        return;
+    }
+
     int rc = ble_gap_event_listener_register(
         &_gapListener,
         &ProvisioningStateMachine::bleGapEventCb,
@@ -1204,18 +1370,25 @@ void ProvisioningStateMachine::registerGapEventListener()
     );
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to register BLE GAP event listener: %d", rc);
+        return;
     }
+    _gapListenerRegistered = true;
 }
 
 void ProvisioningStateMachine::unregisterGapEventListener()
 {
+    if (!_gapListenerRegistered) {
+        return;
+    }
     ble_gap_event_listener_unregister(&_gapListener);
+    _gapListenerRegistered = false;
 }
 
 void ProvisioningStateMachine::onBleConnectionReceived()
 {
     ESP_LOGI(TAG, "BLE connection received — entering provisioning mode");
     _isBluetoothConnected = true;
+    noteProvisioningActivity();
 }
 
 void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t eventBase,
@@ -1241,6 +1414,7 @@ void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t 
             case WIFI_PROV_CRED_RECV: {
                 wifi_sta_config_t* wifi_sta_cfg = (wifi_sta_config_t*)eventData;
                 ESP_LOGI(TAG, "Received credentials for SSID: %s", wifi_sta_cfg->ssid);
+                self->noteProvisioningActivity();
 
                 strncpy(self->_pendingSsid, (const char*)wifi_sta_cfg->ssid,
                         sizeof(self->_pendingSsid) - 1);
@@ -1250,12 +1424,14 @@ void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t 
                 ESP_LOGI(TAG, "Verifying credentials against Wi-Fi router...");
                 self->_lastStaDisconnectReason = 0;
                 self->_credentialsReceived = true;
+                self->_provisioningSessionHadNewCredentials = true;
                 self->transitionTo(ProvisioningState::ProvisioningState_VerifyCredentials);
                 break;
             }
 
             case WIFI_PROV_CRED_SUCCESS:
                 ESP_LOGI(TAG, "Provisioning credential verification SUCCESS");
+                self->noteProvisioningActivity();
                 self->transitionTo(ProvisioningState::ProvisioningState_Success);
                 break;
 
@@ -1291,6 +1467,7 @@ void ProvisioningStateMachine::wifiProvEventHandler(void* arg, esp_event_base_t 
                          apNotFound ? "AP not found" : "Wi-Fi verification failed",
                          self->_lastStaDisconnectReason);
 
+                self->noteProvisioningActivity();
                 self->_resetProvisioningManagerOnFailure = true;
                 self->transitionTo(ProvisioningState::ProvisioningState_Failed);
                 break;
@@ -1316,6 +1493,9 @@ int ProvisioningStateMachine::bleGapEventCb(struct ble_gap_event* event, void* a
             if (event->connect.status == 0) {
                 ESP_LOGI(TAG, "BLE connected, handle=%d", event->connect.conn_handle);
                 self->_isBluetoothConnected = true;
+                self->_bleConnHandle = event->connect.conn_handle;
+                self->_bleConnHandleValid = true;
+                self->noteProvisioningActivity();
                 self->transitionTo(ProvisioningState::ProvisioningState_Connected);
             } else {
                 ESP_LOGW(TAG, "BLE connection failed, status=%d", event->connect.status);
@@ -1325,6 +1505,8 @@ int ProvisioningStateMachine::bleGapEventCb(struct ble_gap_event* event, void* a
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "BLE disconnected, reason=%d", event->disconnect.reason);
             self->_isBluetoothConnected = false;
+            self->_bleConnHandleValid = false;
+            self->noteProvisioningActivity();
             break;
     }
 

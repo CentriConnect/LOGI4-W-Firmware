@@ -218,7 +218,7 @@ ILogiHardwareDriver *EspLogiHardwareFactory::CreateLogiHardware()
         }
 
         // v1.2.1 fix: CONFIG_PM_SLP_DISABLE_GPIO=y isolates all GPIOs on every
-        // auto light-sleep entry (48h provisioning window, REQ-PROV-02). That
+        // auto light-sleep entry (provisioning window, REQ-PROV-02). That
         // dropped SENSOR_POWER (SPS) and LED_STANDBY (IS31FL3193 SDB) each sleep
         // interval - SPS re-ramping on every wake re-triggers the I2C bus clamp
         // (see SPS note above) and SDB dropping hardware-shuts-down the LED

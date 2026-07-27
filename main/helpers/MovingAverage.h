@@ -5,7 +5,15 @@
 
 class MovingAverage {
 public:
-    static const unsigned char CAPACITY = 5;
+    static const unsigned char CAPACITY = 3;
+
+    struct State {
+        unsigned short samples[CAPACITY];
+        unsigned int size;
+        unsigned int sum;
+        unsigned char count;
+        unsigned char index;
+    };
     
     explicit MovingAverage();
     
@@ -13,6 +21,8 @@ public:
     void clear();
     bool getOutput(unsigned short& value) const;
     bool getOutput(int32_t& value) const;
+    void saveState(State& state) const;
+    bool restoreState(const State& state);
     
     bool isEmpty() const { return count_ == 0; }
     bool isFull() const { return size_ > 0 && count_ == size_; }

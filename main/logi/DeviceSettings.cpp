@@ -1,5 +1,7 @@
 #include "DeviceSettings.h"
 #include <string.h> // For memcpy, strcpy, strncpy, strcmp
+#include <ctype.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "MQTT/AwsIotConfig.h"
 
@@ -28,6 +30,52 @@ const char *DeviceSettings::KEY_DEFAULTS_SET = "DefaultsSet";
 #ifndef CONFIG_LOGI_DEFAULT_DEVICE_ID
 #define CONFIG_LOGI_DEFAULT_DEVICE_ID "00000000-0000-0000-0000-000000000000"
 #endif
+
+static void normalizeMqttScheduledPost(const char *input, char *output, size_t outputSize)
+{
+    if (output == nullptr || outputSize == 0)
+    {
+        return;
+    }
+
+    output[0] = '\0';
+    if (input == nullptr || input[0] == '\0')
+    {
+        return;
+    }
+
+    int hour = 0;
+    int minute = 0;
+    unsigned int dayByte = 0;
+    int consumed = 0;
+    bool parsed = sscanf(input, " %d:%d;%x %n", &hour, &minute, &dayByte, &consumed) == 3;
+
+    if (parsed)
+    {
+        while (input[consumed] != '\0' && isspace(static_cast<unsigned char>(input[consumed])))
+        {
+            consumed++;
+        }
+        parsed = input[consumed] == '\0';
+    }
+
+    if (!parsed || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    {
+        ESP_LOGW("DeviceSettings", "Invalid mqtt_scheduled_post '%s'; defaulting to 00:00;FF", input);
+        snprintf(output, outputSize, "00:00;FF");
+        return;
+    }
+
+    if (dayByte > 0xFF || !(dayByte & 0x80) || ((dayByte & 0x7F) == 0))
+    {
+        ESP_LOGW("DeviceSettings",
+                 "mqtt_scheduled_post '%s' has invalid/no MQTT days; defaulting mask to FF",
+                 input);
+        dayByte = 0xFF;
+    }
+
+    snprintf(output, outputSize, "%02d:%02d;%02X", hour, minute, dayByte & 0xFF);
+}
 
 // --- Constructor ---
 DeviceSettings::DeviceSettings(ISettingsService &settingsService) : _settingsService(settingsService),
@@ -373,6 +421,16 @@ bool DeviceSettings::loadOrDefaultMqttScheduledPost()
     if (actual_size > 0 && actual_size <= MQTT_SCHEDULED_POST_BUFFER_SIZE)
     {
         _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE - 1] = '\0';
+        char normalized[MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+        normalizeMqttScheduledPost(_mqttScheduledPost, normalized, sizeof(normalized));
+        if (strcmp(_mqttScheduledPost, normalized) != 0)
+        {
+            strncpy(_mqttScheduledPost, normalized, MQTT_SCHEDULED_POST_BUFFER_SIZE - 1);
+            _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE - 1] = '\0';
+            return _settingsService.SetValue(KEY_MQTT_SCHED_POST,
+                                             reinterpret_cast<const uint8_t *>(_mqttScheduledPost),
+                                             strlen(_mqttScheduledPost) + 1);
+        }
         return true;
     }
 
@@ -748,12 +806,9 @@ bool DeviceSettings::setMqttScheduledPost(const char *schedule)
 {
     if (!_initialized)
         return false;
-    if (schedule == nullptr)
-        schedule = "";
 
-    ESP_LOGI(TAG, "Setting mqtt_scheduled_post to: %s", schedule);
-    strncpy(_mqttScheduledPost, schedule, MQTT_SCHEDULED_POST_BUFFER_SIZE - 1);
-    _mqttScheduledPost[MQTT_SCHEDULED_POST_BUFFER_SIZE - 1] = '\0';
+    normalizeMqttScheduledPost(schedule, _mqttScheduledPost, sizeof(_mqttScheduledPost));
+    ESP_LOGI(TAG, "Setting mqtt_scheduled_post to: %s", _mqttScheduledPost);
 
     bool success = _settingsService.SetValue(KEY_MQTT_SCHED_POST,
                                              reinterpret_cast<const uint8_t *>(_mqttScheduledPost),

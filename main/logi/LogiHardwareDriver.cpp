@@ -10,11 +10,26 @@
 static RTC_DATA_ATTR int s_last_battery_mv_filtered = 0;
 static RTC_DATA_ATTR int s_last_solar_mv_filtered = 0;
 static RTC_DATA_ATTR int s_last_batt_temp_mv_filtered = 0; 
+static RTC_DATA_ATTR int s_last_fuel_level_filtered = 0;
+static RTC_DATA_ATTR int s_last_fuel_mv_filtered = 0;
+static RTC_DATA_ATTR int s_last_fuel_supply_mv = 0;
 static RTC_DATA_ATTR bool s_last_ambient_valid = false;
 static RTC_DATA_ATTR float s_last_ambient_c = 0.0f;
 static RTC_DATA_ATTR float s_last_humidity_pct = 0.0f;
 static RTC_DATA_ATTR bool s_last_gps_valid = false;
 static RTC_DATA_ATTR GpsData_t s_last_gps_data = {};
+
+static constexpr uint32_t FUEL_MOVING_AVERAGE_STATE_MAGIC = 0x46554156; // "FUAV"
+
+struct PersistedMovingAverageState
+{
+    uint32_t magic;
+    MovingAverage::State state;
+};
+
+static RTC_DATA_ATTR PersistedMovingAverageState s_fuel_level_filter_state = {};
+static RTC_DATA_ATTR PersistedMovingAverageState s_fuel_raw_mv_filter_state = {};
+static RTC_DATA_ATTR PersistedMovingAverageState s_fuel_supply_mv_filter_state = {};
 
 // Platform-specific includes for logging and delays
 #ifdef ESP_PLATFORM 
@@ -76,6 +91,9 @@ LogiHardwareDriver::LogiHardwareDriver(
       _batteryMovingAverageFilter(),
       _solarMovingAverageFilter(),
       _batteryTempMovingAverageFilter(),
+      _fuelLevelMovingAverageFilter(),
+      _fuelRawMillivoltsMovingAverageFilter(),
+      _fuelSupplyMillivoltsMovingAverageFilter(),
       _tempSensorTempMovingAverageFilter(),    // Filter for truncated temperature
       _tempSensorHumidityMovingAverageFilter() // Filter for truncated humidity
 {
@@ -103,6 +121,33 @@ void LogiHardwareDriver::DelayMs(uint32_t milliseconds)
         usleep(milliseconds * 1000);
     }
 #endif
+}
+
+static unsigned short clampToMovingAverageSample(int value)
+{
+    if (value < 0)
+    {
+        return 0;
+    }
+    if (value > UINT16_MAX)
+    {
+        return UINT16_MAX;
+    }
+    return static_cast<unsigned short>(value);
+}
+
+static bool restorePersistedMovingAverage(MovingAverage& filter,
+                                          const PersistedMovingAverageState& persisted)
+{
+    return persisted.magic == FUEL_MOVING_AVERAGE_STATE_MAGIC &&
+           filter.restoreState(persisted.state);
+}
+
+static void persistMovingAverage(const MovingAverage& filter,
+                                 PersistedMovingAverageState& persisted)
+{
+    filter.saveState(persisted.state);
+    persisted.magic = FUEL_MOVING_AVERAGE_STATE_MAGIC;
 }
 
 bool LogiHardwareDriver::InitializeLedWithRecovery(const char* context)
@@ -229,12 +274,60 @@ void LogiHardwareDriver::UpdateAdcReadingsAndFilters()
     // is the regulated nominal (can't be read over I2C with SPS high).
     _sensorPowerGpio.Write(true);
     DelayMs(50);  // settle the +3.3S rail + fuel head
-    if (!_analogLevelSensor.Read(_last_fuel_level_percent, _last_fuel_mv, _last_fuel_supply_mv))
+
+    int fuel_level_percent_raw = 0;
+    int fuel_mv_raw = 0;
+    int fuel_supply_mv_raw = 0;
+    if (!_analogLevelSensor.Read(fuel_level_percent_raw, fuel_mv_raw, fuel_supply_mv_raw))
     {
         LOGI_DRV_LOG_ERR("Failed to read Analog Level Sensor");
         Faults_Set(FAULT_FUEL);
-        _last_fuel_mv = 0;
-        _last_fuel_supply_mv = 0;
+        _last_fuel_level_percent = s_last_fuel_level_filtered;
+        _last_fuel_mv = s_last_fuel_mv_filtered;
+        _last_fuel_supply_mv = s_last_fuel_supply_mv;
+    }
+    else
+    {
+        _fuelLevelMovingAverageFilter.addSample(clampToMovingAverageSample(fuel_level_percent_raw));
+        _fuelRawMillivoltsMovingAverageFilter.addSample(clampToMovingAverageSample(fuel_mv_raw));
+        _fuelSupplyMillivoltsMovingAverageFilter.addSample(clampToMovingAverageSample(fuel_supply_mv_raw));
+
+        unsigned short filtered_fuel_level = 0;
+        unsigned short filtered_fuel_mv = 0;
+        unsigned short filtered_fuel_supply_mv = 0;
+        if (_fuelLevelMovingAverageFilter.getOutput(filtered_fuel_level))
+        {
+            _last_fuel_level_percent = filtered_fuel_level;
+            s_last_fuel_level_filtered = _last_fuel_level_percent;
+        }
+        else
+        {
+            _last_fuel_level_percent = fuel_level_percent_raw;
+        }
+
+        if (_fuelRawMillivoltsMovingAverageFilter.getOutput(filtered_fuel_mv))
+        {
+            _last_fuel_mv = filtered_fuel_mv;
+            s_last_fuel_mv_filtered = _last_fuel_mv;
+        }
+        else
+        {
+            _last_fuel_mv = fuel_mv_raw;
+        }
+
+        if (_fuelSupplyMillivoltsMovingAverageFilter.getOutput(filtered_fuel_supply_mv))
+        {
+            _last_fuel_supply_mv = filtered_fuel_supply_mv;
+            s_last_fuel_supply_mv = _last_fuel_supply_mv;
+        }
+        else
+        {
+            _last_fuel_supply_mv = fuel_supply_mv_raw;
+        }
+
+        persistMovingAverage(_fuelLevelMovingAverageFilter, s_fuel_level_filter_state);
+        persistMovingAverage(_fuelRawMillivoltsMovingAverageFilter, s_fuel_raw_mv_filter_state);
+        persistMovingAverage(_fuelSupplyMillivoltsMovingAverageFilter, s_fuel_supply_mv_filter_state);
     }
     _sensorPowerGpio.Write(false);
 
@@ -316,8 +409,14 @@ bool LogiHardwareDriver::Initialize()
     _batteryMovingAverageFilter.clear();
     _solarMovingAverageFilter.clear();
     _batteryTempMovingAverageFilter.clear();
+    _fuelLevelMovingAverageFilter.clear();
+    _fuelRawMillivoltsMovingAverageFilter.clear();
+    _fuelSupplyMillivoltsMovingAverageFilter.clear();
     _tempSensorTempMovingAverageFilter.clear();
     _tempSensorHumidityMovingAverageFilter.clear();
+    restorePersistedMovingAverage(_fuelLevelMovingAverageFilter, s_fuel_level_filter_state);
+    restorePersistedMovingAverage(_fuelRawMillivoltsMovingAverageFilter, s_fuel_raw_mv_filter_state);
+    restorePersistedMovingAverage(_fuelSupplyMillivoltsMovingAverageFilter, s_fuel_supply_mv_filter_state);
 
     if (!_analogLevelSensor.IsInitialized())
     {
@@ -484,7 +583,7 @@ void LogiHardwareDriver::GetLatestSensorData(LogiSensorData &sensorData)
 
     // --- Fuel ---
     sensorData.PublishedFuelLevel = static_cast<uint8_t>(_last_fuel_level_percent);
-    // Use actual voltage readings from the AnalogLevelSensor
+    // Use filtered voltage readings from the AnalogLevelSensor
     sensorData.AnalogFuelVoltage = static_cast<float>(_last_fuel_mv) / 1000.0f;
     sensorData.SensorSupplyVoltage = static_cast<float>(_last_fuel_supply_mv) / 1000.0f;
 

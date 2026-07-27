@@ -340,6 +340,37 @@ DeviceShadowState PostingStateMachine::buildReportedShadowFromSettings(const Dev
     return reported;
 }
 
+bool PostingStateMachine::handleWifiResetRequestFromShadow(DeviceShadowState& shadowState, const char* source)
+{
+    if (!shadowState.wifi_reset_req_valid || !_parentStateMachine)
+    {
+        return false;
+    }
+
+    time_t now = _timeKeeper ? _timeKeeper->GetCurrentTime() : time(nullptr);
+
+    if (shadowState.wifi_reset_req)
+    {
+        if (_parentStateMachine->isWifiResetRepairModeExpired(now))
+        {
+            ESP_LOGW(TAG, "%s wifi_reset_req=true expired after 48 hours; reporting request cleared",
+                     source ? source : "Shadow");
+            shadowState.wifi_reset_req = false;
+            shadowState.wifi_reset_req_valid = true;
+            shadowState.clear_wifi_reset_req_desired = true;
+            return true;
+        }
+
+        ESP_LOGW(TAG, "%s wifi_reset_req=true; arming Wi-Fi reset repair advertising mode",
+                 source ? source : "Shadow");
+        _parentStateMachine->requestWifiResetRepairMode(now);
+        return false;
+    }
+
+    _parentStateMachine->clearWifiResetRepairMode();
+    return false;
+}
+
 void PostingStateMachine::PostingStateInitialEnter()
 {
     ESP_LOGI(TAG, "Entering Posting State Machine");
@@ -367,9 +398,13 @@ void PostingStateMachine::PostingStateInitialEnter()
         return;
     }
 
-    if (_parentStateMachine &&
-        !_parentStateMachine->isPostQueueEmpty() &&
-        _parentStateMachine->peekPostQueueTransport() == PostTransport::PostTransport_Udp)
+    const bool queueHasUdpPost = _parentStateMachine &&
+                                 !_parentStateMachine->isPostQueueEmpty() &&
+                                 _parentStateMachine->peekPostQueueTransport() == PostTransport::PostTransport_Udp;
+    const bool wifiResetRepairExpired = _parentStateMachine &&
+                                        _parentStateMachine->isWifiResetRepairModeExpired(_timeKeeper->GetCurrentTime());
+
+    if (queueHasUdpPost && !wifiResetRepairExpired)
     {
         if (!_timeKeeper->IsTimeSynced())
         {
@@ -387,6 +422,11 @@ void PostingStateMachine::PostingStateInitialEnter()
 
         transitionTo(PostingState::PostingState_DoPostsFromQueue);
         return;
+    }
+
+    if (queueHasUdpPost && wifiResetRepairExpired)
+    {
+        ESP_LOGI(TAG, "Wi-Fi reset repair window expired; running MQTT shadow clear before compact UDP post");
     }
 
     // Proceed to connect - time sync happens after WiFi is connected
@@ -557,23 +597,16 @@ void PostingStateMachine::PostingStateSendGetShadowDelta()
         ESP_LOGI(TAG, "Activation [2/5]: shadow fetched; applying settings to memory");
         applyShadowSettingsToMemory(_shadowState);
 
-        if (_shadowState.wifi_reset_req_valid && _parentStateMachine)
-        {
-            if (_shadowState.wifi_reset_req)
-            {
-                ESP_LOGW(TAG, "Shadow wifi_reset_req=true; arming Wi-Fi reset repair advertising mode");
-                _parentStateMachine->requestWifiResetRepairMode(_timeKeeper->GetCurrentTime());
-            }
-            else
-            {
-                _parentStateMachine->clearWifiResetRepairMode();
-            }
-        }
+        bool clearExpiredWifiReset = handleWifiResetRequestFromShadow(_shadowState, "Shadow");
 
         DeviceShadowState reportedState = buildReportedShadowFromSettings(_shadowState);
         if (_awsIotManager->UpdateShadowWithStatus(reportedState))
         {
             ESP_LOGI(TAG, "Shadow reported state updated after applying settings");
+            if (clearExpiredWifiReset && _parentStateMachine)
+            {
+                _parentStateMachine->clearWifiResetRepairMode();
+            }
         }
         else
         {
@@ -637,18 +670,7 @@ void PostingStateMachine::PostingStateHandleShadowDelta()
     // 2. Persist accepted shadow values to DeviceSettings/NVS before reporting.
     applyShadowSettingsToMemory(_shadowState);
 
-    if (_shadowState.wifi_reset_req_valid && _parentStateMachine)
-    {
-        if (_shadowState.wifi_reset_req)
-        {
-            ESP_LOGW(TAG, "Shadow delta wifi_reset_req=true; arming Wi-Fi reset repair advertising mode");
-            _parentStateMachine->requestWifiResetRepairMode(_timeKeeper->GetCurrentTime());
-        }
-        else
-        {
-            _parentStateMachine->clearWifiResetRepairMode();
-        }
-    }
+    bool clearExpiredWifiReset = handleWifiResetRequestFromShadow(_shadowState, "Shadow delta");
 
     // 3. Post the updated state back to the shadow's "reported" section.
     //    This confirms to the cloud that we have accepted and applied the changes.
@@ -656,6 +678,10 @@ void PostingStateMachine::PostingStateHandleShadowDelta()
     if (_awsIotManager->UpdateShadowWithStatus(reportedState))
     {
         ESP_LOGI(TAG, "Successfully reported the updated shadow state.");
+        if (clearExpiredWifiReset && _parentStateMachine)
+        {
+            _parentStateMachine->clearWifiResetRepairMode();
+        }
     }
     else
     {

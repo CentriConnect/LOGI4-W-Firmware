@@ -140,7 +140,7 @@ NVS **before** entering provisioning mode.
   bool or repeated auth failures.
 - *See* OPEN-Q-1 (which reset reasons count as "power cycle").
 
-**REQ-PROV-02 (NEW).** During the 48-hour provisioning window, device shall use **light sleep**
+**REQ-PROV-02 (NEW).** During the provisioning window, device shall use **light sleep**
 with BLE advertising at a **1000 ms** interval (per Nick's 2026-06-01 #6, grounded in the
 2026-04-30 power study: ~3.79 mA / ~111 days at 1000 ms light-sleep ADV).
 - *Acceptance:* Joulescope shows light-sleep current floor (~3.4 mA) during the prov window; BLE
@@ -152,8 +152,8 @@ with BLE advertising at a **1000 ms** interval (per Nick's 2026-06-01 #6, ground
 **REQ-PROV-03 (UNCHANGED).** Normal duty cycle uses **deep sleep** between minute wakes — no BLE
 advertising during normal duty cycle (existing prov-reqs #1).
 
-**REQ-PROV-04 (UNCHANGED).** After the 48-hour prov window expires: valid creds → normal duty
-cycle; invalid → deep sleep until next reboot (existing prov-reqs #6).
+**REQ-PROV-04 (UPDATED).** After the provisioning window expires: valid creds -> normal duty
+cycle; invalid -> blue LED off and connectable BLE repair beacon until a phone connection re-enters provisioning.
 
 ---
 
@@ -263,7 +263,7 @@ bench unit was on battery per Email 2026-06-01 #3).
    semantic-versioned ("1.0"), or something else? Need a schema-version naming scheme.
 7. **`bleadv` scope.** REV B defines `ble_adv_time` as a shadow field with default 8000 ms, but
    per REQ-PROV-03 the device does not advertise during normal duty cycle. So `bleadv` only takes
-   effect during the 48-hour provisioning window — confirm. And: during prov mode, should device
+   effect during the provisioning window — confirm. And: during prov mode, should device
    honor the shadow value or always use 1000 ms per Email 2026-06-01 #6?
 
 ---

@@ -62,9 +62,11 @@ public:
 
     bool checkAndConnectWifi();
     void onProvisioningWifiRecovered();
+    void requestProvisioningTimeoutRepairMode(time_t now);
     void requestWifiResetRepairMode(time_t now);
     void clearWifiResetRepairMode();
     bool isWifiResetRepairModeActive(time_t now) const;
+    bool isWifiResetRepairModeExpired(time_t now) const;
 
     // Update weekly schedules from shadow state and persist to NVS
     bool updateSchedulesFromShadow(const DeviceShadowState& shadowState);

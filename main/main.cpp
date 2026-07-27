@@ -18,6 +18,7 @@
 #define TEST_MODE  2  // 0=Hardware Test, 1=BLE Test, 2=Original App, 3=GNSS Test, 4=FOTA Test
 
 #include "esp_log.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -1305,6 +1306,7 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "--- Device Starting ---");
 
+#if CONFIG_LOG_DEFAULT_LEVEL > 0
     printf("\n\n=== LOGI4W Application Firmware ===\n");
 #if BOOT_FLASH_WINDOW_SEC > 0
     // Reflash-safety countdown (gated behind BOOT_FLASH_WINDOW_SEC; see define).
@@ -1317,6 +1319,7 @@ extern "C" void app_main(void)
     printf("\nStarting application...\n\n");
 #else
     printf("Flash window disabled (BOOT_FLASH_WINDOW_SEC=0); starting application immediately.\n\n");
+#endif
 #endif
 
     if (!Platform::InitializeSystem()) {

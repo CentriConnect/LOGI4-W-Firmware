@@ -119,14 +119,7 @@ bool ParseEnhancedShadowDocument(const char* payload, DeviceShadowState& stateOu
             else { stateOut.fill_dwell_time = v; success = true; }
         }
 
-        // REV B renames lte_timeout -> wifi_timeout; accept BOTH for cellular-schema compat.
-        // wifi_timeout takes precedence if both present.
-        item = cJSON_GetObjectItem(config, "lte_timeout");
-        if (item && cJSON_IsNumber(item)) {
-            uint32_t v = (uint32_t)item->valueint;
-            if (v < MIN_WIFI_TIMEOUT_S) { ESP_LOGW(TAG, "lte_timeout %u below min %u — rejected", (unsigned)v, (unsigned)MIN_WIFI_TIMEOUT_S); }
-            else { stateOut.lte_timeout = v; success = true; }
-        }
+        // Wi-Fi firmware accepts only wifi_timeout from the cloud schema.
         item = cJSON_GetObjectItem(config, "wifi_timeout");
         if (item && cJSON_IsNumber(item)) {
             uint32_t v = (uint32_t)item->valueint;

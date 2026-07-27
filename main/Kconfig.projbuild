@@ -109,9 +109,13 @@ menu "Featured FreeRTOS IoT Integration"
                 int "The brightness level of the blue LED. (0-255)"
                 default 255
 
-            config LOGI_PROVISIONING_TIMEOUT_HOURS
-                int "Total time in hours to remain in provisioning mode before deep sleep."
-                default 48
+            config LOGI_PROVISIONING_TIMEOUT_MINUTES
+                int "Total time in minutes to remain in full provisioning mode before repair BLE beacon."
+                default 60
+                help
+                    Production uses a 60 minute provisioning idle timeout before
+                    leaving full provisioning mode and arming the BLE repair beacon.
+                    Bench builds may override this lower to verify timeout behavior.
 
             config LOGI_USB_ALLOWS_CHIP_RESET
                 bool "USB host attached: keep USB-Serial-JTAG chip-reset path enabled (remote reflash)"

@@ -342,7 +342,7 @@ firmware: wipe NVS credentials on ESP_RST_POWERON only (REQ-PROV-01)
 
 ---
 
-### Step 5 — Light sleep during 48 h provisioning window (REQ-PROV-02)
+### Step 5 — Light sleep during provisioning window (REQ-PROV-02)
 
 **Why fifth:** Independent of #6 and #7, but should come after #4 so a power-cycle re-prov correctly
 enters the new light-sleep mode.
@@ -403,12 +403,10 @@ idf.py build && idf.py -p <COM> flash monitor
 4. **Prov-to-duty transition:**
    - Provision device, watch Joulescope during the transition.
    - Should see current drop from ~3.8 mA → deep-sleep floor within ~5 s of successful prov.
-5. **48 h window expiry:**
-   - Skip live test (48 h too long). Instead, temporarily reduce `LOGI_PROVISIONING_TIMEOUT_HOURS`
-     in Kconfig to 1 minute for this test build.
-   - After 1 min in prov without creds: device should enter deep sleep until reboot
-     (existing prov-reqs #6). Joulescope confirms current drops to deep-sleep floor.
-   - Restore Kconfig value to 48 h before committing.
+5. **Provisioning window expiry:**
+   - For test builds, set `LOGI_PROVISIONING_TIMEOUT_MINUTES=5`.
+   - After the timeout in prov without creds: device should turn the blue LED off and enter connectable BLE repair-beacon mode.
+   - Production should set `LOGI_PROVISIONING_TIMEOUT_MINUTES=120`.
 
 **Pass criteria**
 - [ ] Prov-mode mean current 3.6–4.0 mA (matches study).

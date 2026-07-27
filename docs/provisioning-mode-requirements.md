@@ -12,6 +12,6 @@ Hey Nick, just want to run my some of the firmware decisions from our meeting to
 
 5. While phone holds connection, firmware runs a inactivity time out of 5 mins, drops connection, continues advertising
 
-6. After 48hr elapsed provisioning mode, if device has valid credentials, continue normal duty cycle. If not, deep sleep until another reboot occurs.
+6. After the provisioning idle timeout elapses (1 hour in production), if device has valid credentials, continue normal duty cycle. If not, turn the blue LED off and enter BLE repair-beacon mode. A phone connection to the repair beacon brings the device back into provisioning mode.
 
 7. In the case that device has existing NVS wifi credentials and enters provisioning mode, old credentials should not be overwritten UNTIL new credentials are received and tested (shadow reset bool must be cleared before reboot)

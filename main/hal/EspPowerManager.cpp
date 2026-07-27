@@ -103,8 +103,7 @@ void EspPowerManager::Sleep(uint64_t durationUs) {
     }
 
     ESP_LOGI(TAG, "Entering deep sleep now...");
-    // Ensure logs are flushed before sleeping
-    esp_log_level_set("*", ESP_LOG_NONE); // Optional: Reduce boot logs if desired
+    // Give UART/USB logging a moment to drain before sleep.
     vTaskDelay(pdMS_TO_TICKS(10)); // Short delay to allow log flush
 
     esp_deep_sleep_start(); // This function does not return

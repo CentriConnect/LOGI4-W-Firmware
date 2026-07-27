@@ -17,8 +17,9 @@ RTC_DATA_ATTR static int64_t s_wifiOutageStartTime = 0;
 RTC_DATA_ATTR static int64_t s_wifiResetRepairStartTime = 0;
 RTC_DATA_ATTR static bool s_wifiRepairAdvertisingRequested = false;
 RTC_DATA_ATTR static bool s_repairBleConnectionRequested = false;
+RTC_DATA_ATTR static bool s_activationProvisioningTimeoutRepairActive = false;
 static constexpr uint8_t AUTH_FAILURE_THRESHOLD = 10;
-static constexpr int64_t WIFI_REPAIR_ADVERTISING_DELAY_S = 0; // Debug: advertise immediately after first Wi-Fi failure.
+static constexpr int64_t WIFI_REPAIR_ADVERTISING_DELAY_S = 0;
 static constexpr int64_t WIFI_RESET_REPAIR_WINDOW_S = 48LL * 60LL * 60LL;
 static constexpr uint32_t WIFI_REPAIR_BLE_ADV_INTERVAL_MS = 4000;
 #include "DataSampleStateMachine.h"
@@ -254,6 +255,7 @@ bool ApplicationStateMachine::init()
 #endif
 
     WakeupReason wakeup_reason = _powerManager->GetWakeupReason();
+
     if (wakeup_reason == WAKEUP_REASON_RESET)
     {
         // If no credentials on first boot, enter provisioning mode
@@ -265,7 +267,6 @@ bool ApplicationStateMachine::init()
             ESP_LOGI(TAG, "Stored Wi-Fi credentials found; deferring Wi-Fi connection until a post is due");
         }
     }
-
     // Check for force-provisioning flag (set by shadow reset bool handler)
     if (currentState != ApplicationState::ApplicationState_Provisioning) {
         if (checkForceProvisioningFlag()) {
@@ -467,12 +468,12 @@ void ApplicationStateMachine::buildBleServiceName(char *serviceName, size_t maxL
         {
             char prefix[5] = {0};
             strncpy(prefix, uuid, 4);
-            snprintf(serviceName, maxLen, "MyPropane-%s", prefix);
+            snprintf(serviceName, maxLen, "MyPropane-%s-R", prefix);
             return;
         }
     }
 
-    snprintf(serviceName, maxLen, "MyPropane");
+    snprintf(serviceName, maxLen, "MyPropane-R");
 }
 
 void ApplicationStateMachine::markWifiOutageStarted(time_t now)
@@ -480,8 +481,8 @@ void ApplicationStateMachine::markWifiOutageStarted(time_t now)
     if (s_wifiOutageStartTime == 0)
     {
         // A Wi-Fi outage can be detected before SNTP has made wall-clock time
-        // valid on this wake. Still arm the repair path; a zero repair delay
-        // should advertise immediately after the first failed connect.
+        // valid on this wake. Still arm the repair path; production advertises
+        // immediately after the first failed Wi-Fi connect.
         s_wifiOutageStartTime = now > 0 ? static_cast<int64_t>(now) : 1;
         ESP_LOGW(TAG, "Wi-Fi outage timer started at %lld (now=%ld)",
                  s_wifiOutageStartTime,
@@ -497,7 +498,16 @@ void ApplicationStateMachine::clearWifiOutage()
     }
     s_wifiOutageStartTime = 0;
     s_wifiRepairAdvertisingRequested = false;
+    s_activationProvisioningTimeoutRepairActive = false;
     stopWifiRepairAdvertising();
+}
+
+void ApplicationStateMachine::requestProvisioningTimeoutRepairMode(time_t now)
+{
+    s_activationProvisioningTimeoutRepairActive = true;
+    markWifiOutageStarted(now);
+    ESP_LOGW(TAG, "Activation provisioning timed out; BLE repair advertising armed (%lu ms interval)",
+             static_cast<unsigned long>(WIFI_REPAIR_BLE_ADV_INTERVAL_MS));
 }
 
 void ApplicationStateMachine::requestWifiResetRepairMode(time_t now)
@@ -525,6 +535,13 @@ bool ApplicationStateMachine::isWifiResetRepairModeActive(time_t now) const
     return (static_cast<int64_t>(now) - s_wifiResetRepairStartTime) < WIFI_RESET_REPAIR_WINDOW_S;
 }
 
+bool ApplicationStateMachine::isWifiResetRepairModeExpired(time_t now) const
+{
+    return s_wifiResetRepairStartTime > 0 &&
+           now > 0 &&
+           (static_cast<int64_t>(now) - s_wifiResetRepairStartTime) >= WIFI_RESET_REPAIR_WINDOW_S;
+}
+
 void ApplicationStateMachine::clearWifiResetRepairMode()
 {
     if (s_wifiResetRepairStartTime != 0)
@@ -536,6 +553,11 @@ void ApplicationStateMachine::clearWifiResetRepairMode()
 
 bool ApplicationStateMachine::isWifiOutageRepairDue(time_t now) const
 {
+    if (s_activationProvisioningTimeoutRepairActive)
+    {
+        return true;
+    }
+
     if (s_wifiOutageStartTime <= 0)
     {
         return false;
@@ -553,7 +575,8 @@ bool ApplicationStateMachine::isWifiOutageRepairDue(time_t now) const
 void ApplicationStateMachine::startWifiRepairAdvertisingIfDue(time_t now)
 {
     const bool wifiResetRepairActive = isWifiResetRepairModeActive(now);
-    if ((!isWifiOutageRepairDue(now) && !wifiResetRepairActive) || !_bleManager)
+    const bool activationRepairActive = s_activationProvisioningTimeoutRepairActive;
+    if ((!isWifiOutageRepairDue(now) && !wifiResetRepairActive && !activationRepairActive) || !_bleManager)
     {
         return;
     }
@@ -569,8 +592,18 @@ void ApplicationStateMachine::startWifiRepairAdvertisingIfDue(time_t now)
 
     if (!_bleManager->isAdvertising())
     {
+        const char* reason = "Wi-Fi outage repair due";
+        if (wifiResetRepairActive)
+        {
+            reason = "Cloud Wi-Fi reset repair active";
+        }
+        else if (activationRepairActive)
+        {
+            reason = "Activation provisioning timeout repair active";
+        }
+
         ESP_LOGW(TAG, "%s; starting connectable BLE repair trigger advertising (%s, %lu ms)",
-                 wifiResetRepairActive ? "Cloud Wi-Fi reset repair active" : "Wi-Fi outage repair due",
+                 reason,
                  serviceName,
                  static_cast<unsigned long>(WIFI_REPAIR_BLE_ADV_INTERVAL_MS));
         _bleManager->startAdvertising(serviceName, WIFI_REPAIR_BLE_ADV_INTERVAL_MS);
@@ -818,7 +851,10 @@ void ApplicationStateMachine::ApplicationStateSleep()
     time_t current_time = _timeKeeper.GetCurrentTime();
     uint64_t sleep_duration_us = calculateSleepDurationFrom(current_time);
     const bool wifiResetRepairActive = isWifiResetRepairModeActive(current_time);
-    const bool repairAdvertisingDue = isWifiOutageRepairDue(current_time) || wifiResetRepairActive;
+    const bool activationRepairActive = s_activationProvisioningTimeoutRepairActive;
+    const bool repairAdvertisingDue = isWifiOutageRepairDue(current_time) ||
+                                      wifiResetRepairActive ||
+                                      activationRepairActive;
 
     ESP_LOGI(TAG, "All tasks complete. %s for %llu us...",
              repairAdvertisingDue ? "Staying discoverable in repair BLE mode" : "Entering deep sleep",

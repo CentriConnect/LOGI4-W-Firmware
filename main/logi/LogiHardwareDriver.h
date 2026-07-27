@@ -101,13 +101,16 @@ private:
     MovingAverage _batteryMovingAverageFilter;
     MovingAverage _solarMovingAverageFilter;
     MovingAverage _batteryTempMovingAverageFilter;
+    MovingAverage _fuelLevelMovingAverageFilter;
+    MovingAverage _fuelRawMillivoltsMovingAverageFilter;
+    MovingAverage _fuelSupplyMillivoltsMovingAverageFilter;
     MovingAverage _tempSensorTempMovingAverageFilter;     
     MovingAverage _tempSensorHumidityMovingAverageFilter; 
 
     // Store latest PROCESSED values needed across methods
     int _last_fuel_level_percent = 0;
-    int _last_fuel_mv = 0;           // Actual fuel sensor ADC voltage
-    int _last_fuel_supply_mv = 0;    // Actual fuel sensor supply voltage
+    int _last_fuel_mv = 0;           // Filtered fuel sensor ADC voltage
+    int _last_fuel_supply_mv = 0;    // Filtered fuel sensor supply voltage
     int _last_battery_mv_filtered = 0;
     int _last_solar_mv_filtered = 0;
     int _last_batt_temp_mv_filtered = 0;

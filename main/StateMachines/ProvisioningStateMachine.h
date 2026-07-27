@@ -23,7 +23,7 @@ class ProvisioningStateMachine
 {
 public:
     static constexpr int64_t PROVISIONING_TIMEOUT_MS =
-        static_cast<int64_t>(CONFIG_LOGI_PROVISIONING_TIMEOUT_HOURS) * 3600LL * 1000LL;
+        static_cast<int64_t>(CONFIG_LOGI_PROVISIONING_TIMEOUT_MINUTES) * 60LL * 1000LL;
 
     static constexpr int64_t SUCCESS_DISPLAY_MS =
         static_cast<int64_t>(CONFIG_LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN) * 60LL * 1000LL;
@@ -83,8 +83,12 @@ private:
     bool _isBluetoothConnected = false;
     bool _credentialsReceived = false;
     bool _initialized = false;
+    bool _provisioningSessionHadNewCredentials = false;
+    bool _forceRepairBeaconOnTimeout = false;
+    uint16_t _bleConnHandle = 0;
+    bool _bleConnHandleValid = false;
 
-    // Timestamp-based timeout (replaces FreeRTOS timer)
+    // Timestamp-based idle timeout (replaces FreeRTOS timer)
     int64_t _provisioningStartTimeMs = 0;
     int64_t _successDisplayStartMs = 0;
     int64_t _stateEnteredMs = 0; // deadman reference: stamped on every transition
@@ -113,6 +117,12 @@ private:
     ApplicationStateMachine* _parentStateMachine = nullptr;
 
     ble_gap_event_listener _gapListener;
+    bool _gapListenerRegistered = false;
+    bool _eventHandlersRegistered = false;
+    esp_event_handler_instance_t _wifiProvEventInstance = nullptr;
+    esp_event_handler_instance_t _wifiEventInstance = nullptr;
+    esp_event_handler_instance_t _protoBleEventInstance = nullptr;
+    esp_event_handler_instance_t _ipEventInstance = nullptr;
 
     char _pendingSsid[33] = {0};
     char _pendingPassword[65] = {0};
@@ -132,6 +142,8 @@ private:
 
     // Helpers
     bool isProvisioningTimedOut() const;
+    void noteProvisioningActivity();
+    void handleConnectedIdleTimeout();
     esp_err_t startProvisioningService();
     void stopProvisioningService();
     esp_err_t getDeviceServiceName(char* serviceName, size_t maxLen);
@@ -144,7 +156,11 @@ private:
     esp_err_t backupCurrentCredentials();
     esp_err_t restoreBackupCredentials();
     bool loadCredentialsFromNvs(char* ssid, size_t ssidLen, char* password, size_t passLen);
+    void restoreBackupAfterFailedProvisioning();
+    void quiesceWifiBeforeProvisioningRetry();
 
+    bool registerProvisioningEventHandlers();
+    void unregisterProvisioningEventHandlers();
     void registerGapEventListener();
     void unregisterGapEventListener();
 
