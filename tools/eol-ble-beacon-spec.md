@@ -25,6 +25,9 @@ scan window to associate the `LW` and `LI` packets.
 
 All multi-byte integer fields are unsigned little-endian.
 
+Temperature is a signed 8-bit Celsius value rounded to the nearest whole
+degree. Decode it as int8, not uint8.
+
 The device ID prefix field is not an integer. It is the first 8 hex characters
 of the programmed RFC4122 UUID/device ID encoded as 4 raw bytes in canonical
 UUID string order. Example: device ID `412a5ffe-a8e0-4b4f-b50b-505443837674`
@@ -42,7 +45,7 @@ Maximum payload length is 25 bytes.
 | --- | ---: | --- |
 | 0 | 2 | Company ID, `0xFFFF` |
 | 2 | 2 | Magic, ASCII `LW` |
-| 4 | 1 | Schema version, currently `1` |
+| 4 | 1 | Measured ambient temperature, signed C |
 | 5 | 1 | Flags |
 | 6 | 4 | FNV-1a 32-bit hash of programmed device ID string |
 | 10 | 1 | Firmware major |
@@ -63,7 +66,7 @@ Maximum payload length is 14 bytes.
 | --- | ---: | --- |
 | 0 | 2 | Company ID, `0xFFFF` |
 | 2 | 2 | Magic, ASCII `LI` |
-| 4 | 1 | Schema version, currently `1` |
+| 4 | 1 | Measured ambient temperature, signed C |
 | 5 | 1 | Flags |
 | 6 | 4 | FNV-1a 32-bit hash of programmed device ID string |
 | 10 | 4 | Programmed device ID prefix bytes |
@@ -82,7 +85,7 @@ device ID prefix encoded flag is clear.
 | 4 | Sensor supply voltage is valid |
 | 5 | Fuel level is valid |
 | 6 | Device ID prefix bytes are encoded in the `LI` scan response |
-| 7 | Reserved |
+| 7 | Ambient temperature is valid |
 
 ## Fault Bits
 
@@ -106,7 +109,8 @@ The advertisement carries the lower 16 bits of the firmware fault accumulator.
 - Treat missing `LW` or missing `LI` after a 5-second active scan as EOL fail or
   retry, depending on station policy.
 - Treat mismatched `LW` and `LI` device ID hashes as unrelated packets.
-- Treat schema versions other than `1` as unsupported.
+- `LW` and `LI` should report the same measured ambient temperature byte.
+- Treat the ambient temperature byte as valid only when flag bit 7 is set.
 - The `LI` packet carries only the first 8 hex characters of the programmed
   device ID. Do not attempt to reconstruct the full UUID from the BLE packet.
 - Pass/fail thresholds should live in the PC tester, not firmware.

@@ -29,10 +29,11 @@ const char* ProvisioningStateMachine::NVS_BACKUP_PASS_KEY = "backup_pass";
 static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
 static constexpr uint32_t PROVISIONING_SUCCESS_BLE_GRACE_MS = 3000;
 static constexpr uint16_t LOGI_BLE_COMPANY_ID = 0xFFFF; // Internal/test manufacturer ID.
-static constexpr uint8_t LOGI_EOL_BLE_SCHEMA_VERSION = 1;
 static constexpr size_t LOGI_EOL_ADV_PAYLOAD_LEN = 25;
 static constexpr size_t LOGI_EOL_SCAN_RESPONSE_PAYLOAD_LEN = 14;
 static constexpr size_t LOGI_EOL_DEVICE_ID_PREFIX_BYTES = 4;
+static constexpr float LOGI_EOL_TEMP_MIN_C = -40.0f;
+static constexpr float LOGI_EOL_TEMP_MAX_C = 85.0f;
 static bool s_eolBleBurstRanThisBoot = false;
 
 enum EolBleFlags : uint8_t {
@@ -43,6 +44,7 @@ enum EolBleFlags : uint8_t {
     EOL_FLAG_SUPPLY_VALID    = 1u << 4,
     EOL_FLAG_FUEL_VALID      = 1u << 5,
     EOL_FLAG_DEVICE_ID_PREFIX_ENCODED = 1u << 6,
+    EOL_FLAG_TEMPERATURE_VALID = 1u << 7,
 };
 
 static void appendU8(uint8_t* buffer, size_t capacity, size_t& len, uint8_t value)
@@ -75,6 +77,19 @@ static uint16_t voltsToMillivolts(float volts)
         return 65535;
     }
     return static_cast<uint16_t>(mv);
+}
+
+static uint8_t temperatureToInt8C(float temperatureC)
+{
+    float clamped = temperatureC;
+    if (clamped < -128.0f) {
+        clamped = -128.0f;
+    } else if (clamped > 127.0f) {
+        clamped = 127.0f;
+    }
+
+    const int rounded = static_cast<int>(clamped >= 0.0f ? clamped + 0.5f : clamped - 0.5f);
+    return static_cast<uint8_t>(static_cast<int8_t>(rounded));
 }
 
 static uint32_t fnv1a32(const char* value)
@@ -1001,6 +1016,10 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
                                   ? sensorData.PublishedFuelLevel * 10u
                                   : 0u);
     const uint16_t faults = static_cast<uint16_t>(Faults_Get() & 0xFFFFu);
+    const uint8_t temperatureC = temperatureToInt8C(sensorData.MeasuredTemperatureC);
+    const bool temperatureValid = sensorData.MeasuredTemperatureC >= LOGI_EOL_TEMP_MIN_C &&
+                                  sensorData.MeasuredTemperatureC <= LOGI_EOL_TEMP_MAX_C &&
+                                  (faults & FAULT_AMB) == 0;
 
     uint8_t flags = 0;
     if (deviceIdValid) flags |= EOL_FLAG_DEVICE_ID_VALID;
@@ -1010,12 +1029,13 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     if (sensorSupplyMv > 0) flags |= EOL_FLAG_SUPPLY_VALID;
     if (sensorData.PublishedFuelLevel <= 100) flags |= EOL_FLAG_FUEL_VALID;
     if (deviceIdPrefixEncoded) flags |= EOL_FLAG_DEVICE_ID_PREFIX_ENCODED;
+    if (temperatureValid) flags |= EOL_FLAG_TEMPERATURE_VALID;
 
     advPayloadLen = 0;
     appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, LOGI_BLE_COMPANY_ID);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, 'L');
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, 'W');
-    appendU8(advPayload, advPayloadCapacity, advPayloadLen, LOGI_EOL_BLE_SCHEMA_VERSION);
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, temperatureC);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, flags);
     appendU32Le(advPayload, advPayloadCapacity, advPayloadLen, deviceIdHash);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_MAJOR);
@@ -1032,7 +1052,7 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     appendU16Le(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, LOGI_BLE_COMPANY_ID);
     appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, 'L');
     appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, 'I');
-    appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, LOGI_EOL_BLE_SCHEMA_VERSION);
+    appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, temperatureC);
     appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, flags);
     appendU32Le(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, deviceIdHash);
     for (uint8_t byte : deviceIdPrefixBytes) {
@@ -1040,11 +1060,12 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     }
 
     ESP_LOGI(TAG,
-             "EOL BLE payload: flags=0x%02X fw=%d.%d.%d bat=%u sol=%u raw=%u sup=%u fuel_x10=%u faults=0x%04X id_hash=0x%08lX",
+             "EOL BLE payload: flags=0x%02X fw=%d.%d.%d temp_c=%d bat=%u sol=%u raw=%u sup=%u fuel_x10=%u faults=0x%04X id_hash=0x%08lX",
              flags,
              CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
              CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
              CONFIG_LOGI_SOFTWARE_VERSION_REVISION,
+             static_cast<int>(static_cast<int8_t>(temperatureC)),
              batteryMv,
              solarMv,
              sensorRawMv,
