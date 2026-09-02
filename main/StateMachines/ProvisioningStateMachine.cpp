@@ -30,6 +30,9 @@ static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
 static constexpr uint32_t PROVISIONING_SUCCESS_BLE_GRACE_MS = 3000;
 static constexpr uint16_t LOGI_BLE_COMPANY_ID = 0xFFFF; // Internal/test manufacturer ID.
 static constexpr uint8_t LOGI_EOL_BLE_SCHEMA_VERSION = 1;
+static constexpr size_t LOGI_EOL_ADV_PAYLOAD_LEN = 25;
+static constexpr size_t LOGI_EOL_SCAN_RESPONSE_PAYLOAD_LEN = 14;
+static constexpr size_t LOGI_EOL_DEVICE_ID_PREFIX_BYTES = 4;
 static bool s_eolBleBurstRanThisBoot = false;
 
 enum EolBleFlags : uint8_t {
@@ -39,7 +42,7 @@ enum EolBleFlags : uint8_t {
     EOL_FLAG_SENSOR_VALID    = 1u << 3,
     EOL_FLAG_SUPPLY_VALID    = 1u << 4,
     EOL_FLAG_FUEL_VALID      = 1u << 5,
-    EOL_FLAG_UUID_ENCODED    = 1u << 6,
+    EOL_FLAG_DEVICE_ID_PREFIX_ENCODED = 1u << 6,
 };
 
 static void appendU8(uint8_t* buffer, size_t capacity, size_t& len, uint8_t value)
@@ -95,16 +98,19 @@ static int hexValue(char c)
     return -1;
 }
 
-static bool parseUuidBytes(const char* uuid, uint8_t out[16])
+static bool parseUuidPrefixBytes(const char* uuid, uint8_t out[LOGI_EOL_DEVICE_ID_PREFIX_BYTES])
 {
-    uint8_t bytes[16] = {0};
+    uint8_t bytes[LOGI_EOL_DEVICE_ID_PREFIX_BYTES] = {0};
     size_t nibbleCount = 0;
     for (const char* p = uuid; p != nullptr && *p != '\0'; ++p) {
+        if (nibbleCount >= LOGI_EOL_DEVICE_ID_PREFIX_BYTES * 2) {
+            break;
+        }
         if (*p == '-') {
             continue;
         }
         int value = hexValue(*p);
-        if (value < 0 || nibbleCount >= 32) {
+        if (value < 0) {
             return false;
         }
         if ((nibbleCount & 1u) == 0) {
@@ -115,11 +121,11 @@ static bool parseUuidBytes(const char* uuid, uint8_t out[16])
         nibbleCount++;
     }
 
-    if (nibbleCount != 32) {
+    if (nibbleCount != LOGI_EOL_DEVICE_ID_PREFIX_BYTES * 2) {
         return false;
     }
 
-    memcpy(out, bytes, 16);
+    memcpy(out, bytes, LOGI_EOL_DEVICE_ID_PREFIX_BYTES);
     return true;
 }
 
@@ -914,8 +920,8 @@ void ProvisioningStateMachine::runEolBleBurstIfNeeded()
         return;
     }
 
-    uint8_t advPayload[26] = {0};
-    uint8_t scanResponsePayload[29] = {0};
+    uint8_t advPayload[LOGI_EOL_ADV_PAYLOAD_LEN] = {0};
+    uint8_t scanResponsePayload[LOGI_EOL_SCAN_RESPONSE_PAYLOAD_LEN] = {0};
     size_t advPayloadLen = 0;
     size_t scanResponsePayloadLen = 0;
     if (!buildEolBlePayloads(advPayload,
@@ -966,7 +972,8 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
                                                    size_t& scanResponsePayloadLen)
 {
     if (advPayload == nullptr || scanResponsePayload == nullptr ||
-        advPayloadCapacity < 23 || scanResponsePayloadCapacity < 26) {
+        advPayloadCapacity < LOGI_EOL_ADV_PAYLOAD_LEN ||
+        scanResponsePayloadCapacity < LOGI_EOL_SCAN_RESPONSE_PAYLOAD_LEN) {
         return false;
     }
 
@@ -981,8 +988,9 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
                          _deviceSettings->isDeviceIdValid() &&
                          _deviceSettings->getDeviceId(deviceId, sizeof(deviceId));
 
-    uint8_t uuidBytes[16] = {0};
-    const bool uuidEncoded = deviceIdValid && parseUuidBytes(deviceId, uuidBytes);
+    uint8_t deviceIdPrefixBytes[LOGI_EOL_DEVICE_ID_PREFIX_BYTES] = {0};
+    const bool deviceIdPrefixEncoded = deviceIdValid &&
+                                       parseUuidPrefixBytes(deviceId, deviceIdPrefixBytes);
     const uint32_t deviceIdHash = deviceIdValid ? fnv1a32(deviceId) : 0;
     const uint16_t batteryMv = voltsToMillivolts(sensorData.AnalogBatteryVoltage);
     const uint16_t solarMv = voltsToMillivolts(sensorData.SolarVoltage);
@@ -993,7 +1001,6 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
                                   ? sensorData.PublishedFuelLevel * 10u
                                   : 0u);
     const uint16_t faults = static_cast<uint16_t>(Faults_Get() & 0xFFFFu);
-    const uint16_t uptimeS = static_cast<uint16_t>((esp_timer_get_time() / 1000000ULL) & 0xFFFFu);
 
     uint8_t flags = 0;
     if (deviceIdValid) flags |= EOL_FLAG_DEVICE_ID_VALID;
@@ -1002,7 +1009,7 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     if (sensorRawMv > 0) flags |= EOL_FLAG_SENSOR_VALID;
     if (sensorSupplyMv > 0) flags |= EOL_FLAG_SUPPLY_VALID;
     if (sensorData.PublishedFuelLevel <= 100) flags |= EOL_FLAG_FUEL_VALID;
-    if (uuidEncoded) flags |= EOL_FLAG_UUID_ENCODED;
+    if (deviceIdPrefixEncoded) flags |= EOL_FLAG_DEVICE_ID_PREFIX_ENCODED;
 
     advPayloadLen = 0;
     appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, LOGI_BLE_COMPANY_ID);
@@ -1010,6 +1017,7 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, 'W');
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, LOGI_EOL_BLE_SCHEMA_VERSION);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, flags);
+    appendU32Le(advPayload, advPayloadCapacity, advPayloadLen, deviceIdHash);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_MAJOR);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_MINOR);
     appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_REVISION);
@@ -1019,7 +1027,6 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, sensorSupplyMv);
     appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, fuelTenthsPct);
     appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, faults);
-    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, uptimeS);
 
     scanResponsePayloadLen = 0;
     appendU16Le(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, LOGI_BLE_COMPANY_ID);
@@ -1028,7 +1035,7 @@ bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
     appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, LOGI_EOL_BLE_SCHEMA_VERSION);
     appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, flags);
     appendU32Le(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, deviceIdHash);
-    for (uint8_t byte : uuidBytes) {
+    for (uint8_t byte : deviceIdPrefixBytes) {
         appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, byte);
     }
 
