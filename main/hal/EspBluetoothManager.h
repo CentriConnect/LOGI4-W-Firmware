@@ -8,6 +8,8 @@
 #include "freertos/timers.h"
 #include "sdkconfig.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 
 class EspBluetoothManager
@@ -25,6 +27,15 @@ public:
 
     /// Start advertising with a device name (safe to call before host sync; it will defer)
     bool startAdvertising(const char* name, uint32_t intervalMs = 1000);
+
+    /// Start advertising with custom manufacturer data and optional scan response.
+    bool startAdvertisingWithManufacturerData(const char* name,
+                                              uint32_t intervalMs,
+                                              const uint8_t* manufacturerData,
+                                              size_t manufacturerDataLen,
+                                              const uint8_t* scanResponseManufacturerData = nullptr,
+                                              size_t scanResponseManufacturerDataLen = 0,
+                                              bool connectable = true);
 
     /// Stop advertising (no-op if not advertising)
     void stopAdvertising();
@@ -61,6 +72,11 @@ private:
 
     // GAP helpers
     int  setAdvData(const char* name);
+    int  setManufacturerAdvData(const char* name,
+                                const uint8_t* manufacturerData,
+                                size_t manufacturerDataLen,
+                                const uint8_t* scanResponseManufacturerData,
+                                size_t scanResponseManufacturerDataLen);
     void startAdvertisingInternal();
 
     // State
@@ -81,6 +97,12 @@ private:
     // Requested name to use for ADV when ready
     char _advName[32] = "Autient-ESP";
     uint32_t _advIntervalMs = 1000;
+    bool _advConnectable = true;
+    bool _useManufacturerAdvData = false;
+    uint8_t _manufacturerAdvData[26] = {0};
+    size_t _manufacturerAdvDataLen = 0;
+    uint8_t _scanResponseManufacturerData[29] = {0};
+    size_t _scanResponseManufacturerDataLen = 0;
 
     // Own address type chosen at runtime
     uint8_t _ownAddrType = 0;

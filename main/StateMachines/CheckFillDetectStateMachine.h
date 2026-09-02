@@ -34,6 +34,7 @@ private:
     CheckFillDetectState currentState = CheckFillDetectState::CheckFillDetectState_CheckInDwellMode;
 
     bool _inDwell = false;
+    bool _hasStableLevel = false;
     float _currentFillLevel = 0.0f;
     float _lastStableLevel = 0.0f;
     int64_t _dwellDeadline = 0;
@@ -46,6 +47,7 @@ private:
     void CheckFillDetectStateCheckDwellTime();
     void persistDwellState();
     void clearDwellState(float stableLevel);
+    bool enqueueMqttScheduledPostIfDue();
     void sleepUntilNextWake();
     void enqueueFinalFillUdpPost();
 };

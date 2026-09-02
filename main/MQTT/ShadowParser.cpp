@@ -14,7 +14,7 @@ static const char* TAG = "ShadowParser";
 // minimum are rejected (logged WARN, previous value preserved). 0 means
 // "field not set, do not apply" — used for delta detection elsewhere.
 static constexpr uint32_t MIN_FILL_DWELL_TIME_S   = 300;
-static constexpr uint32_t MIN_WIFI_TIMEOUT_S      = 15;
+static constexpr uint32_t MIN_WIFI_TIMEOUT_S      = 300;
 static constexpr uint8_t  MIN_FILL_ALARM_DELTA    = 10;
 static constexpr uint32_t MIN_POST_DWELL_TIME_S   = 60;
 static constexpr uint32_t MIN_MQTT_TIMEOUT_S      = AWS_IOT_MIN_WATERFALL_TIMEOUT_S;

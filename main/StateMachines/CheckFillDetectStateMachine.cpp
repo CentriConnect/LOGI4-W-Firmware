@@ -4,15 +4,41 @@
 #include "EspTimeKeeper.h"
 #include "esp_log.h"
 #include "esp_attr.h"  // For RTC_DATA_ATTR
+#include <cstdio>
+#include <ctime>
 
 static const char *TAG = "CheckFillDetectStateMachine";
 
 // RTC_DATA_ATTR variables survive deep sleep (stored in RTC slow memory)
 // These track fill detection state across wake cycles
 RTC_DATA_ATTR static bool s_inDwell = false;
+RTC_DATA_ATTR static bool s_hasStableLevel = false;
 RTC_DATA_ATTR static float s_lastStableLevel = 0.0f;
 RTC_DATA_ATTR static float s_lastPotentialFillLevel = 0.0f;
 RTC_DATA_ATTR static int64_t s_dwellDeadline = 0;
+RTC_DATA_ATTR static int64_t s_lastDwellMqttPostMinute = -1;
+
+static bool parseMqttScheduleString(const char* schedule, int& hour, int& minute, uint8_t& daysOfWeek)
+{
+    if (schedule == nullptr || schedule[0] == '\0')
+    {
+        return false;
+    }
+
+    unsigned int dayByte = 0;
+    if (sscanf(schedule, "%d:%d;%x", &hour, &minute, &dayByte) != 3)
+    {
+        return false;
+    }
+
+    if (!(dayByte & 0x80) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    {
+        return false;
+    }
+
+    daysOfWeek = static_cast<uint8_t>(dayByte & 0x7F);
+    return daysOfWeek != 0;
+}
 
 
 CheckFillDetectStateMachine::CheckFillDetectStateMachine(EspTimeKeeper* timeKeeper, const DeviceSettings& deviceSettings, LogiSensorData& sensorData):
@@ -22,6 +48,7 @@ CheckFillDetectStateMachine::CheckFillDetectStateMachine(EspTimeKeeper* timeKeep
 {
     // Restore state from RTC memory
     _inDwell = s_inDwell;
+    _hasStableLevel = s_hasStableLevel;
     _lastStableLevel = s_lastStableLevel;
     _dwellDeadline = s_dwellDeadline;
 }
@@ -76,6 +103,18 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckInDwellMode()
 
     ESP_LOGI(TAG, "Fill Detection - Current: %.1f%%, LastStable: %.1f%%, InDwell: %s, Deadline: %lld",
              _currentFillLevel, _lastStableLevel, _inDwell ? "YES" : "NO", _dwellDeadline);
+
+    if (!_inDwell && !_hasStableLevel)
+    {
+        ESP_LOGI(TAG, "Initializing fill baseline to current level %.1f%%; no fill detection on first stable sample",
+                 _currentFillLevel);
+        _lastStableLevel = _currentFillLevel;
+        s_lastStableLevel = _lastStableLevel;
+        _hasStableLevel = true;
+        s_hasStableLevel = true;
+        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_ScheduleCheck);
+        return;
+    }
 
     if (_inDwell)
     {
@@ -190,9 +229,13 @@ void CheckFillDetectStateMachine::CheckFillDetectStateCheckDwellTime()
     if (remaining <= 0)
     {
         ESP_LOGI(TAG, "Fill event confirmed after dwell: Final level %.1f%%", _currentFillLevel);
+        bool mqttScheduledPostQueued = enqueueMqttScheduledPostIfDue();
         enqueueFinalFillUdpPost();
         clearDwellState(_sensorData.PublishedFuelLevel);
-        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
+        if (!mqttScheduledPostQueued)
+        {
+            _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
+        }
     }
     else
     {
@@ -212,9 +255,11 @@ void CheckFillDetectStateMachine::persistDwellState()
 void CheckFillDetectStateMachine::clearDwellState(float stableLevel)
 {
     _inDwell = false;
+    _hasStableLevel = true;
     _dwellDeadline = 0;
     _lastStableLevel = stableLevel;
     s_inDwell = false;
+    s_hasStableLevel = true;
     s_lastStableLevel = stableLevel;
     s_lastPotentialFillLevel = stableLevel;
     s_dwellDeadline = 0;
@@ -222,10 +267,70 @@ void CheckFillDetectStateMachine::clearDwellState(float stableLevel)
 
 void CheckFillDetectStateMachine::sleepUntilNextWake()
 {
+    if (enqueueMqttScheduledPostIfDue())
+    {
+        return;
+    }
+
     if (_parentStateMachine)
     {
         _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Sleep);
     }
+}
+
+bool CheckFillDetectStateMachine::enqueueMqttScheduledPostIfDue()
+{
+    if (_parentStateMachine == nullptr || _timeKeeper == nullptr)
+    {
+        return false;
+    }
+
+    time_t currentTime = _timeKeeper->GetCurrentTime();
+    if (currentTime <= 0 || !_timeKeeper->IsTimeSynced())
+    {
+        return false;
+    }
+
+    struct tm timeInfo{};
+    if (localtime_r(&currentTime, &timeInfo) == nullptr)
+    {
+        ESP_LOGE(TAG, "Failed to convert current time while checking MQTT schedule during fill dwell");
+        return false;
+    }
+
+    char mqttSchedule[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+    int mqttHour = 0;
+    int mqttMinute = 0;
+    uint8_t mqttDays = 0;
+    if (!_deviceSettings.getMqttScheduledPost(mqttSchedule, sizeof(mqttSchedule)) ||
+        !parseMqttScheduleString(mqttSchedule, mqttHour, mqttMinute, mqttDays))
+    {
+        return false;
+    }
+
+    const int currentMinutes = (timeInfo.tm_hour * 60) + timeInfo.tm_min;
+    const int scheduledMinutes = (mqttHour * 60) + mqttMinute;
+    const int64_t currentPostMinute = static_cast<int64_t>(currentTime) / 60LL;
+
+    if ((mqttDays & (1 << timeInfo.tm_wday)) &&
+        currentMinutes == scheduledMinutes &&
+        currentPostMinute != s_lastDwellMqttPostMinute)
+    {
+        ESP_LOGI(TAG,
+                 "Fill dwell active, but MQTT scheduled post is due: mask 0x%02X, scheduled %02d:%02d, now %02d:%02d. Queueing MQTT heartbeat.",
+                 mqttDays,
+                 mqttHour,
+                 mqttMinute,
+                 timeInfo.tm_hour,
+                 timeInfo.tm_min);
+
+        s_lastDwellMqttPostMinute = currentPostMinute;
+        _parentStateMachine->addToPostQueue(_sensorData, PostTransport::PostTransport_Mqtt);
+        _parentStateMachine->transitionTo(ApplicationState::ApplicationState_Posting);
+        return true;
+    }
+
+    return false;
 }
 
 void CheckFillDetectStateMachine::enqueueFinalFillUdpPost()

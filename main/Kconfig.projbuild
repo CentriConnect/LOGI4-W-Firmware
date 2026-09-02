@@ -19,7 +19,7 @@ menu "Featured FreeRTOS IoT Integration"
 
             config LOGI_MIN_LTE_TIMEOUT_S
                 int "Wake mode timeout before returning to sleep when prompted to send data in seconds."
-                default 15
+                default 300
 
             config LOGI_DEFAULT_FILL_PERCENT_DELTA
                 int "The fuel level increase, in percent, that must occur to trigger a 'fill' event."
@@ -148,6 +148,24 @@ menu "Featured FreeRTOS IoT Integration"
             config LOGI_BLE_INACTIVITY_TIMEOUT_MIN
                 int "Minutes of BLE connection inactivity before dropping the connection."
                 default 5
+
+            config LOGI_EOL_BLE_BURST_ENABLED
+                bool "Enable one-shot EOL BLE diagnostics burst before provisioning"
+                default y
+                help
+                    When entering provisioning mode, advertise compact factory
+                    diagnostics for a short window before starting the normal
+                    Wi-Fi provisioning BLE service.
+
+            config LOGI_EOL_BLE_BURST_SECONDS
+                int "Seconds to advertise EOL diagnostics before provisioning"
+                depends on LOGI_EOL_BLE_BURST_ENABLED
+                default 5
+
+            config LOGI_EOL_BLE_ADV_INTERVAL_MS
+                int "EOL diagnostics BLE advertisement interval in milliseconds"
+                depends on LOGI_EOL_BLE_BURST_ENABLED
+                default 100
 
             config LOGI_PROVISIONING_SUCCESS_DISPLAY_MIN
                 int "Minutes to blink green LED after successful provisioning before rebooting."

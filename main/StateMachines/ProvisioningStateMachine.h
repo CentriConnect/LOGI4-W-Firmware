@@ -146,6 +146,13 @@ private:
     void handleConnectedIdleTimeout();
     esp_err_t startProvisioningService();
     void stopProvisioningService();
+    void runEolBleBurstIfNeeded();
+    bool buildEolBlePayloads(uint8_t* advPayload,
+                             size_t advPayloadCapacity,
+                             size_t& advPayloadLen,
+                             uint8_t* scanResponsePayload,
+                             size_t scanResponsePayloadCapacity,
+                             size_t& scanResponsePayloadLen);
     esp_err_t getDeviceServiceName(char* serviceName, size_t maxLen);
     esp_err_t getDevicePop(char* pop, size_t maxLen);
     bool publishFirstBootTelemetry(AwsIotClient* client);

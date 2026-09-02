@@ -12,6 +12,7 @@
 #include "interfaces/IGpioHal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 #include <stdint.h>
 #include <math.h>
 
@@ -150,11 +151,11 @@ private:
     static constexpr double FIXED_RESISTOR = 10000.0;
 
     // LED constants
-    static const uint8_t LED_BRIGHTNESS_YELLOW_RED = 200;
-    static const uint8_t LED_BRIGHTNESS_YELLOW_GREEN = 200;
-    static const uint8_t LED_BRIGHTNESS_GREEN = 200;
-    static const uint8_t LED_BRIGHTNESS_RED = 200;
-    static const uint8_t LED_BRIGHTNESS_BLUE = 200;
+    static constexpr uint8_t LED_BRIGHTNESS_YELLOW_RED = static_cast<uint8_t>(CONFIG_LOGI_RGB_BRIGHTNESS_LEVEL_YELLOW_RED);
+    static constexpr uint8_t LED_BRIGHTNESS_YELLOW_GREEN = static_cast<uint8_t>(CONFIG_LOGI_RGB_BRIGHTNESS_LEVEL_YELLOW_GREEN);
+    static constexpr uint8_t LED_BRIGHTNESS_GREEN = static_cast<uint8_t>(CONFIG_LOGI_RGB_BRIGHTNESS_LEVEL_GREEN);
+    static constexpr uint8_t LED_BRIGHTNESS_RED = static_cast<uint8_t>(CONFIG_LOGI_RGB_BRIGHTNESS_LEVEL_RED);
+    static constexpr uint8_t LED_BRIGHTNESS_BLUE = static_cast<uint8_t>(CONFIG_LOGI_RGB_BRIGHTNESS_LEVEL_BLUE);
     static const uint8_t LED_OUTPUT_CURRENT_REG_VALUE = 0x50;
 
     // Software-driven LED blink (replaces IS31FL3193 hardware breathing).

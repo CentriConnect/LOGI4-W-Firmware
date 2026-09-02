@@ -161,6 +161,11 @@ void EspBluetoothManager::inactivityTimerCb(TimerHandle_t xTimer)
 
 bool EspBluetoothManager::startAdvertising(const char* name, uint32_t intervalMs)
 {
+    _advConnectable = true;
+    _useManufacturerAdvData = false;
+    _manufacturerAdvDataLen = 0;
+    _scanResponseManufacturerDataLen = 0;
+
     if (name && name[0] != '\0')
     {
         // Clamp & copy (keep it simple)
@@ -205,9 +210,89 @@ bool EspBluetoothManager::startAdvertising(const char* name, uint32_t intervalMs
     }
 }
 
+bool EspBluetoothManager::startAdvertisingWithManufacturerData(const char* name,
+                                                               uint32_t intervalMs,
+                                                               const uint8_t* manufacturerData,
+                                                               size_t manufacturerDataLen,
+                                                               const uint8_t* scanResponseManufacturerData,
+                                                               size_t scanResponseManufacturerDataLen,
+                                                               bool connectable)
+{
+    if (manufacturerData == nullptr || manufacturerDataLen == 0)
+    {
+        ESP_LOGE(TAG, "Manufacturer advertising data is required.");
+        return false;
+    }
+    if (manufacturerDataLen > sizeof(_manufacturerAdvData) ||
+        scanResponseManufacturerDataLen > sizeof(_scanResponseManufacturerData))
+    {
+        ESP_LOGE(TAG, "Manufacturer data too large (adv=%u, scan=%u).",
+                 static_cast<unsigned>(manufacturerDataLen),
+                 static_cast<unsigned>(scanResponseManufacturerDataLen));
+        return false;
+    }
+
+    if (name && name[0] != '\0')
+    {
+        strncpy(_advName, name, sizeof(_advName) - 1);
+        _advName[sizeof(_advName) - 1] = '\0';
+    }
+    if (intervalMs < 20)
+    {
+        intervalMs = 20;
+    }
+    if (intervalMs > 10240)
+    {
+        intervalMs = 10240;
+    }
+    _advIntervalMs = intervalMs;
+    _advConnectable = connectable;
+    _useManufacturerAdvData = true;
+    memcpy(_manufacturerAdvData, manufacturerData, manufacturerDataLen);
+    _manufacturerAdvDataLen = manufacturerDataLen;
+    _scanResponseManufacturerDataLen = 0;
+    if (scanResponseManufacturerData != nullptr && scanResponseManufacturerDataLen > 0)
+    {
+        memcpy(_scanResponseManufacturerData,
+               scanResponseManufacturerData,
+               scanResponseManufacturerDataLen);
+        _scanResponseManufacturerDataLen = scanResponseManufacturerDataLen;
+    }
+
+    if (!_initialized)
+    {
+        ESP_LOGE(TAG, "BLE not initialized.");
+        return false;
+    }
+
+    _advertisingRequested = true;
+
+    if (_hostSynced)
+    {
+        if (setManufacturerAdvData(_advName,
+                                   _manufacturerAdvData,
+                                   _manufacturerAdvDataLen,
+                                   _scanResponseManufacturerDataLen > 0 ? _scanResponseManufacturerData : nullptr,
+                                   _scanResponseManufacturerDataLen) != 0)
+        {
+            ESP_LOGE(TAG, "Failed to set manufacturer ADV data.");
+            return false;
+        }
+        startAdvertisingInternal();
+        _advertising = true;
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Host not synced yet; will start manufacturer advertising when ready.");
+    return true;
+}
+
 void EspBluetoothManager::stopAdvertising()
 {
     _advertisingRequested = false;
+    _useManufacturerAdvData = false;
+    _manufacturerAdvDataLen = 0;
+    _scanResponseManufacturerDataLen = 0;
     if (!_advertising)
     {
         return;
@@ -273,7 +358,21 @@ void EspBluetoothManager::onSync()
     ble_svc_gap_device_name_set(_advName);
 
     // If someone requested ADV earlier, kick it off now
-    if (_advertisingRequested && setAdvData(_advName) == 0)
+    int rc = 0;
+    if (_useManufacturerAdvData)
+    {
+        rc = setManufacturerAdvData(_advName,
+                                    _manufacturerAdvData,
+                                    _manufacturerAdvDataLen,
+                                    _scanResponseManufacturerDataLen > 0 ? _scanResponseManufacturerData : nullptr,
+                                    _scanResponseManufacturerDataLen);
+    }
+    else
+    {
+        rc = setAdvData(_advName);
+    }
+
+    if (_advertisingRequested && rc == 0)
     {
         startAdvertisingInternal();
         _advertising = true;
@@ -299,12 +398,47 @@ int EspBluetoothManager::setAdvData(const char* name)
     return ble_gap_adv_set_fields(&f);
 }
 
+int EspBluetoothManager::setManufacturerAdvData(const char* name,
+                                                const uint8_t* manufacturerData,
+                                                size_t manufacturerDataLen,
+                                                const uint8_t* scanResponseManufacturerData,
+                                                size_t scanResponseManufacturerDataLen)
+{
+    struct ble_hs_adv_fields f;
+    memset(&f, 0, sizeof(f));
+
+    f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    f.mfg_data = manufacturerData;
+    f.mfg_data_len = manufacturerDataLen;
+
+    int rc = ble_gap_adv_set_fields(&f);
+    if (rc != 0)
+    {
+        return rc;
+    }
+
+    if (scanResponseManufacturerData != nullptr && scanResponseManufacturerDataLen > 0)
+    {
+        struct ble_hs_adv_fields rsp;
+        memset(&rsp, 0, sizeof(rsp));
+        rsp.mfg_data = scanResponseManufacturerData;
+        rsp.mfg_data_len = scanResponseManufacturerDataLen;
+        rc = ble_gap_adv_rsp_set_fields(&rsp);
+        if (rc != 0)
+        {
+            ESP_LOGW(TAG, "Failed to set scan response manufacturer data, rc=%d", rc);
+        }
+    }
+
+    return rc;
+}
+
 void EspBluetoothManager::startAdvertisingInternal()
 {
     struct ble_gap_adv_params ap;
     memset(&ap, 0, sizeof(ap));
 
-    ap.conn_mode = BLE_GAP_CONN_MODE_UND;
+    ap.conn_mode = _advConnectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON;
     ap.disc_mode = BLE_GAP_DISC_MODE_GEN;
     // BLE units = 0.625 ms. 1000 ms = 0x0640, 8000 ms = 0x3200.
     uint16_t intervalUnits = static_cast<uint16_t>((_advIntervalMs * 8U) / 5U);

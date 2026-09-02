@@ -458,7 +458,7 @@ void PostingStateMachine::PostingStateTryConnect()
     uint32_t remainingBudget = getRemainingPostingBudgetSeconds();
     if (remainingBudget < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
     {
-        ESP_LOGW(TAG, "Remaining wifi_timeout budget too small for MQTT waterfall (%lu s); using UDP fallback/exit",
+        ESP_LOGW(TAG, "Remaining wifi_timeout budget too small for MQTT waterfall (%lu s); posting UDP queue items only",
                  static_cast<unsigned long>(remainingBudget));
         Faults_Set(FAULT_AWS);
         transitionTo(PostingState::PostingState_DoPostsFromQueue);
@@ -502,7 +502,7 @@ void PostingStateMachine::PostingStateTryConnect()
     }
     if (perLegTimeout < AWS_IOT_MIN_WATERFALL_TIMEOUT_S)
     {
-        ESP_LOGW(TAG, "Remaining wifi_timeout budget too small for MQTT waterfall after NTP (%lu s); using UDP fallback/exit",
+        ESP_LOGW(TAG, "Remaining wifi_timeout budget too small for MQTT waterfall after NTP (%lu s); posting UDP queue items only",
                  static_cast<unsigned long>(remainingBudget));
         Faults_Set(FAULT_AWS);
         transitionTo(PostingState::PostingState_DoPostsFromQueue);
@@ -521,7 +521,7 @@ void PostingStateMachine::PostingStateTryConnect()
     }
     else
     {
-        ESP_LOGE(TAG, "AWS MQTT waterfall failed; falling back queued MQTT post(s) to UDP.");
+        ESP_LOGE(TAG, "AWS MQTT waterfall failed; queued MQTT post(s) will not use UDP fallback.");
         Faults_Set(FAULT_AWS);
         transitionTo(PostingState::PostingState_DoPostsFromQueue);
     }
@@ -945,8 +945,9 @@ void PostingStateMachine::PostingStateDoPostsFromQueue()
         }
         else if (!_awsIotManager->GetAwsClient()->IsConnected())
         {
-            ESP_LOGW(TAG, "MQTT unavailable; sending queued MQTT post via compact UDP fallback");
-            posted = UdpTelemetryClient::SendTelemetry(data, telemetryContext);
+            ESP_LOGE(TAG, "MQTT unavailable; leaving queued MQTT post unsent instead of using compact UDP fallback");
+            Faults_Set(FAULT_AWS);
+            posted = false;
         }
         else
         {

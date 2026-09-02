@@ -5,6 +5,8 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/md5.h"
 #include <cstring>
 #include <optional>
@@ -69,6 +71,13 @@ bool AwsIotJobsHandler::RequestPendingJobs() {
 }
 
 bool AwsIotJobsHandler::GetNextJob(AwsIotJob& job) {
+    if (!pending_jobs.empty()) {
+        job = pending_jobs.front();
+        pending_jobs.erase(pending_jobs.begin());
+        current_job = job;
+        return true;
+    }
+
     char topic[256];
     snprintf(topic, sizeof(topic), AWS_IOT_JOBS_START_NEXT_TOPIC, thing_name.c_str());
     
@@ -82,14 +91,23 @@ bool AwsIotJobsHandler::GetNextJob(AwsIotJob& job) {
         return false;
     }
     
-    // The response will come through the MQTT message handler
-    // For now, check if we have pending jobs
-    if (!pending_jobs.empty()) {
-        job = pending_jobs.front();
-        pending_jobs.erase(pending_jobs.begin());
-        current_job = job;
-        return true;
+    static constexpr int JOB_RESPONSE_WAIT_MS = 3000;
+    static constexpr int JOB_RESPONSE_POLL_MS = 100;
+
+    // The response arrives asynchronously on /start-next/accepted and is pushed
+    // into pending_jobs by the MQTT event callback.
+    for (int waitedMs = 0; waitedMs < JOB_RESPONSE_WAIT_MS; waitedMs += JOB_RESPONSE_POLL_MS) {
+        if (!pending_jobs.empty()) {
+            job = pending_jobs.front();
+            pending_jobs.erase(pending_jobs.begin());
+            current_job = job;
+            return true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(JOB_RESPONSE_POLL_MS));
     }
+
+    ESP_LOGI(TAG, "No start-next job response within %d ms", JOB_RESPONSE_WAIT_MS);
     
     return false;
 }

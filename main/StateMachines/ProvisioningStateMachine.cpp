@@ -28,6 +28,100 @@ const char* ProvisioningStateMachine::NVS_BACKUP_SSID_KEY = "backup_ssid";
 const char* ProvisioningStateMachine::NVS_BACKUP_PASS_KEY = "backup_pass";
 static constexpr const char* LOGI_PROVISIONING_POP = "F10974B8";
 static constexpr uint32_t PROVISIONING_SUCCESS_BLE_GRACE_MS = 3000;
+static constexpr uint16_t LOGI_BLE_COMPANY_ID = 0xFFFF; // Internal/test manufacturer ID.
+static constexpr uint8_t LOGI_EOL_BLE_SCHEMA_VERSION = 1;
+static bool s_eolBleBurstRanThisBoot = false;
+
+enum EolBleFlags : uint8_t {
+    EOL_FLAG_DEVICE_ID_VALID = 1u << 0,
+    EOL_FLAG_BATTERY_VALID   = 1u << 1,
+    EOL_FLAG_SOLAR_VALID     = 1u << 2,
+    EOL_FLAG_SENSOR_VALID    = 1u << 3,
+    EOL_FLAG_SUPPLY_VALID    = 1u << 4,
+    EOL_FLAG_FUEL_VALID      = 1u << 5,
+    EOL_FLAG_UUID_ENCODED    = 1u << 6,
+};
+
+static void appendU8(uint8_t* buffer, size_t capacity, size_t& len, uint8_t value)
+{
+    if (len < capacity) {
+        buffer[len++] = value;
+    }
+}
+
+static void appendU16Le(uint8_t* buffer, size_t capacity, size_t& len, uint16_t value)
+{
+    appendU8(buffer, capacity, len, static_cast<uint8_t>(value & 0xFFu));
+    appendU8(buffer, capacity, len, static_cast<uint8_t>((value >> 8) & 0xFFu));
+}
+
+static void appendU32Le(uint8_t* buffer, size_t capacity, size_t& len, uint32_t value)
+{
+    appendU16Le(buffer, capacity, len, static_cast<uint16_t>(value & 0xFFFFu));
+    appendU16Le(buffer, capacity, len, static_cast<uint16_t>((value >> 16) & 0xFFFFu));
+}
+
+static uint16_t voltsToMillivolts(float volts)
+{
+    if (volts <= 0.0f) {
+        return 0;
+    }
+
+    float mv = (volts * 1000.0f) + 0.5f;
+    if (mv > 65535.0f) {
+        return 65535;
+    }
+    return static_cast<uint16_t>(mv);
+}
+
+static uint32_t fnv1a32(const char* value)
+{
+    uint32_t hash = 2166136261u;
+    if (value == nullptr) {
+        return hash;
+    }
+    while (*value != '\0') {
+        hash ^= static_cast<uint8_t>(*value++);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static int hexValue(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool parseUuidBytes(const char* uuid, uint8_t out[16])
+{
+    uint8_t bytes[16] = {0};
+    size_t nibbleCount = 0;
+    for (const char* p = uuid; p != nullptr && *p != '\0'; ++p) {
+        if (*p == '-') {
+            continue;
+        }
+        int value = hexValue(*p);
+        if (value < 0 || nibbleCount >= 32) {
+            return false;
+        }
+        if ((nibbleCount & 1u) == 0) {
+            bytes[nibbleCount / 2] = static_cast<uint8_t>(value << 4);
+        } else {
+            bytes[nibbleCount / 2] |= static_cast<uint8_t>(value);
+        }
+        nibbleCount++;
+    }
+
+    if (nibbleCount != 32) {
+        return false;
+    }
+
+    memcpy(out, bytes, 16);
+    return true;
+}
 
 static bool isWifiAuthFailureReason(int reason)
 {
@@ -322,6 +416,8 @@ void ProvisioningStateMachine::ProvisioningStateInit()
     if (_driver) {
         _driver->SetLedState(LedState::LedState_BlueBlink);
     }
+
+    runEolBleBurstIfNeeded();
 
     // Backup existing credentials before starting (Req #7)
     backupCurrentCredentials();
@@ -803,6 +899,155 @@ void ProvisioningStateMachine::ProvisioningStateTimeout()
 // ============================================================================
 // Provisioning Service Management
 // ============================================================================
+
+void ProvisioningStateMachine::runEolBleBurstIfNeeded()
+{
+#if CONFIG_LOGI_EOL_BLE_BURST_ENABLED
+    if (s_eolBleBurstRanThisBoot) {
+        ESP_LOGD(TAG, "EOL BLE diagnostics burst already ran this boot; skipping");
+        return;
+    }
+    s_eolBleBurstRanThisBoot = true;
+
+    if (_bleManager == nullptr) {
+        ESP_LOGW(TAG, "EOL BLE diagnostics skipped: no BLE manager");
+        return;
+    }
+
+    uint8_t advPayload[26] = {0};
+    uint8_t scanResponsePayload[29] = {0};
+    size_t advPayloadLen = 0;
+    size_t scanResponsePayloadLen = 0;
+    if (!buildEolBlePayloads(advPayload,
+                             sizeof(advPayload),
+                             advPayloadLen,
+                             scanResponsePayload,
+                             sizeof(scanResponsePayload),
+                             scanResponsePayloadLen)) {
+        ESP_LOGW(TAG, "EOL BLE diagnostics skipped: payload build failed");
+        return;
+    }
+
+    if (!_bleManager->isInitialized()) {
+        _bleManager->init();
+        _bleManager->startHost();
+    }
+
+    ESP_LOGI(TAG, "Starting EOL BLE diagnostics burst for %d seconds",
+             CONFIG_LOGI_EOL_BLE_BURST_SECONDS);
+
+    bool started = _bleManager->startAdvertisingWithManufacturerData(
+        "LOGI4W-EOL",
+        CONFIG_LOGI_EOL_BLE_ADV_INTERVAL_MS,
+        advPayload,
+        advPayloadLen,
+        scanResponsePayload,
+        scanResponsePayloadLen,
+        false);
+
+    if (started) {
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_LOGI_EOL_BLE_BURST_SECONDS * 1000));
+    } else {
+        ESP_LOGW(TAG, "EOL BLE diagnostics advertising failed to start");
+    }
+
+    _bleManager->stopAdvertising();
+    _bleManager->deinit();
+    vTaskDelay(pdMS_TO_TICKS(250));
+    ESP_LOGI(TAG, "EOL BLE diagnostics burst complete; starting normal provisioning next");
+#endif
+}
+
+bool ProvisioningStateMachine::buildEolBlePayloads(uint8_t* advPayload,
+                                                   size_t advPayloadCapacity,
+                                                   size_t& advPayloadLen,
+                                                   uint8_t* scanResponsePayload,
+                                                   size_t scanResponsePayloadCapacity,
+                                                   size_t& scanResponsePayloadLen)
+{
+    if (advPayload == nullptr || scanResponsePayload == nullptr ||
+        advPayloadCapacity < 23 || scanResponsePayloadCapacity < 26) {
+        return false;
+    }
+
+    LogiSensorData sensorData{};
+    if (_driver != nullptr) {
+        _driver->UpdateMeasurements();
+        _driver->GetLatestSensorData(sensorData);
+    }
+
+    char deviceId[DeviceSettings::DEVICE_ID_BUFFER_SIZE] = {0};
+    bool deviceIdValid = _deviceSettings != nullptr &&
+                         _deviceSettings->isDeviceIdValid() &&
+                         _deviceSettings->getDeviceId(deviceId, sizeof(deviceId));
+
+    uint8_t uuidBytes[16] = {0};
+    const bool uuidEncoded = deviceIdValid && parseUuidBytes(deviceId, uuidBytes);
+    const uint32_t deviceIdHash = deviceIdValid ? fnv1a32(deviceId) : 0;
+    const uint16_t batteryMv = voltsToMillivolts(sensorData.AnalogBatteryVoltage);
+    const uint16_t solarMv = voltsToMillivolts(sensorData.SolarVoltage);
+    const uint16_t sensorRawMv = voltsToMillivolts(sensorData.AnalogFuelVoltage);
+    const uint16_t sensorSupplyMv = voltsToMillivolts(sensorData.SensorSupplyVoltage);
+    const uint16_t fuelTenthsPct =
+        static_cast<uint16_t>(sensorData.PublishedFuelLevel <= 100
+                                  ? sensorData.PublishedFuelLevel * 10u
+                                  : 0u);
+    const uint16_t faults = static_cast<uint16_t>(Faults_Get() & 0xFFFFu);
+    const uint16_t uptimeS = static_cast<uint16_t>((esp_timer_get_time() / 1000000ULL) & 0xFFFFu);
+
+    uint8_t flags = 0;
+    if (deviceIdValid) flags |= EOL_FLAG_DEVICE_ID_VALID;
+    if (batteryMv > 0) flags |= EOL_FLAG_BATTERY_VALID;
+    if (solarMv > 0) flags |= EOL_FLAG_SOLAR_VALID;
+    if (sensorRawMv > 0) flags |= EOL_FLAG_SENSOR_VALID;
+    if (sensorSupplyMv > 0) flags |= EOL_FLAG_SUPPLY_VALID;
+    if (sensorData.PublishedFuelLevel <= 100) flags |= EOL_FLAG_FUEL_VALID;
+    if (uuidEncoded) flags |= EOL_FLAG_UUID_ENCODED;
+
+    advPayloadLen = 0;
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, LOGI_BLE_COMPANY_ID);
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, 'L');
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, 'W');
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, LOGI_EOL_BLE_SCHEMA_VERSION);
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, flags);
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_MAJOR);
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_MINOR);
+    appendU8(advPayload, advPayloadCapacity, advPayloadLen, CONFIG_LOGI_SOFTWARE_VERSION_REVISION);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, batteryMv);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, solarMv);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, sensorRawMv);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, sensorSupplyMv);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, fuelTenthsPct);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, faults);
+    appendU16Le(advPayload, advPayloadCapacity, advPayloadLen, uptimeS);
+
+    scanResponsePayloadLen = 0;
+    appendU16Le(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, LOGI_BLE_COMPANY_ID);
+    appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, 'L');
+    appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, 'I');
+    appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, LOGI_EOL_BLE_SCHEMA_VERSION);
+    appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, flags);
+    appendU32Le(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, deviceIdHash);
+    for (uint8_t byte : uuidBytes) {
+        appendU8(scanResponsePayload, scanResponsePayloadCapacity, scanResponsePayloadLen, byte);
+    }
+
+    ESP_LOGI(TAG,
+             "EOL BLE payload: flags=0x%02X fw=%d.%d.%d bat=%u sol=%u raw=%u sup=%u fuel_x10=%u faults=0x%04X id_hash=0x%08lX",
+             flags,
+             CONFIG_LOGI_SOFTWARE_VERSION_MAJOR,
+             CONFIG_LOGI_SOFTWARE_VERSION_MINOR,
+             CONFIG_LOGI_SOFTWARE_VERSION_REVISION,
+             batteryMv,
+             solarMv,
+             sensorRawMv,
+             sensorSupplyMv,
+             fuelTenthsPct,
+             faults,
+             static_cast<unsigned long>(deviceIdHash));
+
+    return advPayloadLen <= advPayloadCapacity && scanResponsePayloadLen <= scanResponsePayloadCapacity;
+}
 
 esp_err_t ProvisioningStateMachine::startProvisioningService()
 {

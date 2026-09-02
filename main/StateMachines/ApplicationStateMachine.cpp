@@ -961,6 +961,23 @@ uint64_t ApplicationStateMachine::calculateSleepDurationFrom(time_t now)
             sleepSeconds = std::min(sleepSeconds, untilDwellDeadline);
         }
 
+        if (now > 0 && _timeKeeper.IsTimeSynced())
+        {
+            char mqttSchedule[DeviceSettings::MQTT_SCHEDULED_POST_BUFFER_SIZE] = {0};
+            int mqttHour = 0;
+            int mqttMinute = 0;
+            uint8_t mqttDays = 0;
+            if (_deviceSettings.getMqttScheduledPost(mqttSchedule, sizeof(mqttSchedule)) &&
+                parseScheduleString(mqttSchedule, mqttHour, mqttMinute, mqttDays))
+            {
+                int64_t untilMqttPost = secondsUntilWeeklyTime(now, mqttHour, mqttMinute, mqttDays);
+                if (untilMqttPost > 0)
+                {
+                    sleepSeconds = std::min(sleepSeconds, untilMqttPost);
+                }
+            }
+        }
+
         ESP_LOGI(TAG, "Sleep plan: fill dwell active, sleeping %lld seconds (sample_rate=%lu min)",
                  sleepSeconds,
                  static_cast<unsigned long>(sampleRateMin));
